@@ -1,0 +1,53 @@
+{
+  "name": "chatgpt-images-mcp",
+  "version": "0.1.0",
+  "description": "Local MCP server for image generation through the ChatGPT browser interface",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "chatgpt-images-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js serve",
+    "dev": "tsx src/index.ts serve",
+    "login": "tsx src/index.ts login",
+    "setup": "tsx src/index.ts setup",
+    "paste-cookies": "tsx src/index.ts paste-cookies",
+    "import-cookies": "tsx src/index.ts import-cookies",
+    "accounts": "tsx src/index.ts accounts",
+    "account:add": "tsx src/index.ts account-add",
+    "account:use": "tsx src/index.ts account-use",
+    "status": "tsx src/index.ts status",
+    "browser": "tsx src/index.ts browser",
+    "browser:manual": "tsx src/index.ts browser-manual",
+    "browser:close": "tsx src/index.ts browser-close",
+    "pretest": "npm run build",
+    "test": "tsx --test test/*.test.ts",
+    "test:live": "node scripts/test-live.mjs",
+    "recover": "tsx src/index.ts recover",
+    "check": "tsc --noEmit",
+    "browser:install": "playwright install chromium",
+    "browser:install:webkit": "playwright install webkit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.2.0",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.5",
+    "playwright": "^1.63.0",
+    "proper-lockfile": "^4.1.2",
+    "sharp": "^0.35.5",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.2.0",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.4",
+    "@types/proper-lockfile": "^4.1.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
