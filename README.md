@@ -295,7 +295,7 @@ Generation is asynchronous:
 1. `generate_image` returns a job ID after queue admission.
 2. The worker uploads references, fills the prompt, activates its ChatGPT tab, and clicks Send once.
 3. `wait_for_job` waits up to **25 seconds** per call. If the job is still `queued` or `running`, wait again using the **same job ID**.
-4. When the job completes, the client can show the preview and the saved image path.
+4. When the job completes, call `get_image` to retrieve its saved path and optional preview.
 
 An image may take longer than a single wait call. The default generation timeout is **5 minutes**, configurable in `.env`. Do not submit the same prompt again just because a wait returned before completion. Keep the dedicated Chrome window open while work is running.
 
@@ -336,7 +336,7 @@ Set `same_chat_mandatory: true` when every image must be generated in one conver
 }
 ```
 
-If the quota runs out after two images, the default `same_chat_mandatory: false` keeps those two and generates only the third on the replacement account. With `true`, the worker reruns all three prompts from the beginning in one new chat on that account. Original references, if supplied, are re-uploaded. Job and batch IDs remain unchanged; `attempt` increments on the batch, and each job's `previousAttempts` retains earlier partial results and their image paths. Existing image files are preserved. Another confirmed quota limit can restart the batch again on another untried eligible account.
+If the quota runs out after two images, the default `same_chat_mandatory: false` keeps those two and generates only the third on the replacement account. With `true`, the worker reruns all three prompts from the beginning in one new chat on that account. Original references, if supplied, are re-uploaded. Job and batch IDs remain unchanged. The worker retains earlier attempts and image paths internally. Existing image files are preserved. Another confirmed quota limit can restart the batch again on another untried eligible account.
 
 `same_chat_mandatory: true` disables conversation-length rollover: a conversation-full rejection stops the mandatory batch, so its results never span multiple chats. Uncertain failures never trigger a restart. Mandatory batches reserve their queue capacity until completion so a full replay fits.
 
@@ -392,7 +392,7 @@ For automatic generation failover, only profiles with saved sessions that pass a
 
 To disable automatic switching globally, set `CHATGPT_AUTO_SWITCH_ACCOUNTS=false` in `.env` and restart your MCP clients and worker.
 
-Job and batch IDs keep their original owning account, so keep polling the same IDs after a switch. `executionAccount` reports the profile used for the latest attempt, and `attemptedAccounts` lists the profiles attempted for that job. Images are saved under the generating profile. A batch starts a new chat after switching and re-uploads its original reference snapshots; subsequent prompts continue in that new chat. By default it keeps completed images; `same_chat_mandatory: true` restarts the entire batch in the new chat. Earlier chat messages are not transferred between accounts.
+Job and batch IDs keep their original owning account, so keep polling the same IDs after a switch. Account routing and attempt history remain internal and are omitted from tool responses. Images are saved under the generating profile. A batch starts a new chat after switching and re-uploads its original reference snapshots; subsequent prompts continue in that new chat. By default it keeps completed images; `same_chat_mandatory: true` restarts the entire batch in the new chat. Earlier chat messages are not transferred between accounts.
 
 `recover --job JOB_ID` also uses the recorded execution profile when recovering a failed job's existing image, while keeping its metadata in the original owning profile. Both profiles must be free of runtime locks.
 
@@ -461,9 +461,9 @@ Submission failures now identify whether Send never became ready, the click fail
 
 ### Image limits and failed requests
 
-ChatGPT image limits still apply. A recognized image-limit failure starts this server's persisted **24-hour cooldown for that account**. `session_status` automatically switches from an exhausted profile to a ready fallback and returns the replacement account’s state. If saved, non-exhausted profiles exist but none is currently ready, it selects one and returns its actual `challenge`, `login_required`, or `unavailable` state, keeping the selected browser available for recovery. A profile in use returns `busy`; unreadable session data returns `unavailable`. These conditions do not become the exhausted account’s old usage-limit response. Status calls also return `busy` promptly while generation is running. Generation also skips exhausted profiles. Disabled switching or no available fallback return `blocked` with `errorCode`, `detectedAt`, and `retryAfter` without queuing a new job.
+ChatGPT image limits still apply. A recognized image-limit failure starts this server's persisted **24-hour cooldown for that account**. `session_status` automatically switches from an exhausted profile to a ready fallback and returns the replacement account’s state. If saved, non-exhausted profiles exist but none is currently ready, it selects one and returns its actual `challenge`, `login_required`, or `unavailable` state, keeping the selected browser available for recovery. A profile in use returns `busy`; unreadable session data returns `unavailable`. These conditions do not become the exhausted account’s old usage-limit response. Status calls also return `busy` promptly while generation is running. Generation also skips exhausted profiles. Disabled switching or no available fallback return `blocked` with a concise `error` and `retryAfter` without queuing a new job.
 
-The website's displayed reset text is retained as `limitReset`; it is separate from the server's 24-hour retry policy. Restarting does not clear the cooldown. Completed images remain available, and failed requests are not automatically replayed.
+The website's displayed reset text is retained internally as `limitReset`; it is separate from the server's 24-hour retry policy. Restarting does not clear the cooldown. Completed images remain available, and failed requests are not automatically replayed.
 
 If ChatGPT finished an image but the job failed or timed out, disconnect MCP clients, let other jobs finish, and recover the saved conversation:
 
@@ -531,7 +531,7 @@ For a real MCP smoke test, disconnect clients and finish existing jobs first, th
 npm run test:live
 ```
 
-This runs headlessly and submits **one real ChatGPT image request**, waits for it, retrieves the saved file, and prints its dimensions and conversation URL. Before starting, it closes existing dedicated account browsers so it can reopen them headlessly with their saved sessions. Optional arguments are `--prompt "Your description"` and repeatable `--reference "/absolute/path/to/image.png"`.
+This runs headlessly and submits **one real ChatGPT image request**, waits for it, retrieves the saved file, and prints its path and dimensions. Before starting, it closes existing dedicated account browsers so it can reopen them headlessly with their saved sessions. Optional arguments are `--prompt "Your description"` and repeatable `--reference "/absolute/path/to/image.png"`.
 
 ## MCP tool reference
 
@@ -540,16 +540,18 @@ This runs headlessly and submits **one real ChatGPT image request**, waits for i
 | `session_status` | Check readiness or cooldown for the server-selected session. |
 | `generate_image` | Queue one image; accepts `prompt`, optional `reference_images`, and `aspect_ratio`. |
 | `generate_images` | Queue 1–25 prompts; accepts shared references, ratio, and optional `same_chat_mandatory`. |
-| `wait_for_job` | Wait 0–25 seconds for an existing job; optionally return an image preview. |
-| `get_job_status` | Read one job's status, errors, conversation URL, and image paths. |
-| `get_batch_status` | Read batch progress and jobs. |
-| `get_image` | Retrieve a completed job's image metadata and optional preview. |
+| `wait_for_job` | Wait 0–25 seconds; return only status and last update time, plus failure details if needed. |
+| `get_job_status` | Read a job ID, status, and last update time, plus failure details if needed. |
+| `get_batch_status` | Read batch ID/status and each job ID/status. |
+| `get_image` | Retrieve a completed image's saved path and optional preview. |
 | `list_jobs` | List recent jobs across all profiles; optional `limit` defaults to 20. |
 | `cancel_job` | Cancel a queued job; running jobs cannot be cancelled through MCP. |
-| `list_accounts` | List profile IDs, display names, priorities, selection mode, and saved-session availability. |
+| `list_accounts` | List profile IDs, display names, saved-session availability, and active selection. |
 | `add_account` | Create an empty profile; authenticate privately in the terminal/browser. |
 
-The server selects accounts automatically. Only `add_account` takes an `account` input, to name the new profile. Job/batch lookups infer ownership from the ID. `wait_for_job` requires an individual `job_id`; `get_batch_status` requires `batch_id`. Retrieval tools accept `image_index` (default 0) and `include_preview` (default true).
+The server selects accounts automatically. Only `add_account` takes an `account` input, to name the new profile. Job/batch lookups infer ownership from the ID. `wait_for_job` requires an individual `job_id`; `get_batch_status` requires `batch_id`. `get_image` accepts `image_index` (default 0) and `include_preview` (default true).
+
+Tool responses use compact JSON. `generate_image` returns only `{id, status}`; `generate_images` returns `{id, status, jobs}` with IDs/statuses for its jobs. `wait_for_job` returns `{status, updatedAt}` and never includes image previews. Failed jobs additionally include an actionable error and, when relevant, `retryAfter`. Prompts, references, account routing, conversation URLs, attempt history, and image sizes are retained internally. Use `get_image` for the saved file path and optional preview. Account metadata is limited to account-management tools.
 
 One shared local worker serves both clients. Each account has its own FIFO queue, with up to 25 waiting jobs. Accepted work continues after clients disconnect. Queued jobs survive restarts; interrupted running jobs become failed, and remaining jobs in their batches stop. No uncertain prompt is automatically resubmitted. An explicit conversation-length rejection permits one automatic rollover to a new chat with the original references. A confirmed image usage limit, or an assumed limit after two consecutive completed text-only responses without images, also permits eligible jobs to continue on another signed-in account with those references.
 

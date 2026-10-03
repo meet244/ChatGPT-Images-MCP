@@ -156,14 +156,15 @@ for (const scenario of ['same_chat', 'rollover', 'preflight_rollover', 'usage_li
     const aspectRatio = scenario === 'same_chat' ? undefined : '16:9';
     const initial = parsed(await client.callTool({ name: 'generate_images', arguments: { prompts: ['one', 'two', 'three'], reference_images: [referencePath],
       ...(aspectRatio !== undefined ? { aspect_ratio: aspectRatio } : {}) } }));
-    assert.equal(initial.total, 3);
-    assert.equal(new Set(initial.jobs.map((job: any) => job.referenceImages[0].path)).size, 1, 'References are copied once for the whole batch');
+    assert.equal(initial.jobs.length, 3);
+    assert.equal(new Set(store.getBatch(initial.id).jobs.map(job => job.referenceImages![0]!.path)).size, 1, 'References are copied once for the whole batch');
     await rm(referencePath);
     let batch = initial;
     const deadline = Date.now() + 25_000;
     while (['queued', 'running'].includes(batch.status) && Date.now() < deadline) {
       await delay(100); batch = parsed(await client.callTool({ name: 'get_batch_status', arguments: { batch_id: initial.id } }));
     }
+    batch = store.getBatch(initial.id);
     assert.equal(batch.status, scenario === 'usage_limit' ? 'failed' : 'completed', JSON.stringify(batch));
     const completed = batch.jobs.filter((job: any) => job.status === 'completed');
     assert.equal(completed.length, scenario === 'usage_limit' ? 1 : 3);

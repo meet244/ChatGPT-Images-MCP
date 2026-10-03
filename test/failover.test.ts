@@ -72,7 +72,10 @@ async function fixture(autoSwitch = true) {
     },
     async finished(id: string) {
       await until(() => !['queued', 'running'].includes(store.get(id).status));
-      return parsed(await call('get_job_status', { job_id: id }));
+      const status = parsed(await call('get_job_status', { job_id: id }));
+      const runtime = await manager.resolve(undefined, id);
+      assert.equal(status.status, runtime.store.get(id).status);
+      return { ...runtime.store.get(id), account: runtime.account };
     },
     async close() { await client.close(); await server.close(); await manager.close(); await rm(dir, { recursive: true, force: true }); },
   };
@@ -116,7 +119,7 @@ test('a profile borrowed during quota failover stays open while another queue st
     const first = parsed(await f.call('generate_image', { prompt: 'forwarded' }));
     await until(() => f.calls.some(call => call.account === 'second'));
     const second = parsed(await f.call('generate_image', { prompt: 'own queue' }));
-    assert.equal(second.account, 'second');
+    assert.equal(await f.registry.owner(second.id), 'second');
     releaseForwarded();
     await until(() => f.calls.some(call => call.prompt === 'own queue'));
     await until(() => f.closed.includes('default'));
@@ -133,7 +136,8 @@ test('live priority updates choose the highest number, fail over in priority ord
   const f = await fixture();
   const finish = async (id: string) => {
     await until(async () => parsed(await f.call('get_job_status', { job_id: id })).status === 'completed');
-    return parsed(await f.call('get_job_status', { job_id: id }));
+    const runtime = await f.manager.resolve(undefined, id);
+    return runtime.store.get(id);
   };
   try {
     await f.add('a-later'); await f.add('z-first'); await f.add('empty', false);
@@ -143,7 +147,7 @@ test('live priority updates choose the highest number, fail over in priority ord
     await f.registry.setPriority('z-first', 30);
     f.behavior(async ({ account }) => { if (account === 'z-first') throw new BrowserError('Confirmed quota.', 'image_usage_limit'); });
     const first = parsed(await f.call('generate_image', { prompt: 'prioritized image' }));
-    assert.equal(first.account, 'z-first');
+    assert.equal(await f.registry.owner(first.id), 'z-first');
     const completed = await finish(first.id);
     assert.equal(completed.executionAccount, 'a-later');
     assert.deepEqual(f.calls.map(call => call.account), ['z-first', 'a-later']);
@@ -151,16 +155,16 @@ test('live priority updates choose the highest number, fail over in priority ord
     assert.equal(await f.registry.owner(first.id), 'z-first');
     assert.equal((await f.call('get_image', { job_id: first.id })).isError, undefined);
     const second = parsed(await f.call('generate_image', { prompt: 'skip cooling profile' }));
-    assert.equal(second.account, 'a-later'); await finish(second.id);
+    assert.equal(await f.registry.owner(second.id), 'a-later'); await finish(second.id);
     await f.registry.setPriority('default', 50);
     const third = parsed(await f.call('generate_image', { prompt: 'live new priority' }));
-    assert.equal(third.account, 'default'); await finish(third.id);
+    assert.equal(await f.registry.owner(third.id), 'default'); await finish(third.id);
     await f.registry.select('a-later');
     const fourth = parsed(await f.call('generate_image', { prompt: 'manual choice' }));
-    assert.equal(fourth.account, 'a-later'); await finish(fourth.id);
+    assert.equal(await f.registry.owner(fourth.id), 'a-later'); await finish(fourth.id);
     await f.registry.usePriorityOrder();
     const fifth = parsed(await f.call('generate_image', { prompt: 'priority restored' }));
-    assert.equal(fifth.account, 'default'); await finish(fifth.id);
+    assert.equal(await f.registry.owner(fifth.id), 'default'); await finish(fifth.id);
   } finally { await f.close(); }
 });
 
@@ -181,21 +185,23 @@ test('automatic failover skips unusable profiles, keeps the job ID and image ret
     assert.equal(job.executionAccount, 'e-ready'); assert.deepEqual(job.attemptedAccounts, ['default', 'e-ready']);
     assert.deepEqual(f.calls.map(call => call.account), ['default', 'e-ready']);
     assert.equal(await f.registry.owner(job.id), 'default'); assert.equal(await f.registry.active(), 'e-ready');
-    const preview = await f.call('wait_for_job', { job_id: job.id, wait_seconds: 0 });
+    const waited = await f.call('wait_for_job', { job_id: job.id, wait_seconds: 0 });
+    assert.equal(waited.content.some(item => item.type === 'image'), false);
+    const preview = await f.call('get_image', { job_id: job.id });
     assert.equal(preview.content.some(item => item.type === 'image'), true);
-    assert.ok(parsed(preview).image.path.startsWith(path.join(f.dir, 'accounts/e-ready/images')));
+    assert.ok(parsed(preview).path.startsWith(path.join(f.dir, 'accounts/e-ready/images')));
     const cooldown = f.store.imageCooldown();
     await f.registry.use('default');
     const ready = parsed(await f.call('session_status'));
-    assert.equal(ready.status, 'ready'); assert.equal(ready.account, 'e-ready');
+    assert.equal(ready.status, 'ready'); assert.equal(ready.account, undefined);
     assert.equal(f.calls.length, 2, 'Session routing must not submit another prompt');
     const next = parsed(await f.call('generate_image', { prompt: 'skip the saved cooldown' }));
-    assert.equal(next.account, 'e-ready');
+    assert.equal(await f.registry.owner(next.id), 'e-ready');
     await until(async () => parsed(await f.call('get_job_status', { job_id: next.id })).status === 'completed');
     assert.deepEqual(f.store.imageCooldown(), cooldown, 'Skipped profiles retain their original cooldown');
     const history = parsed(await f.call('list_jobs')).jobs;
-    assert.ok(history.some((item: any) => item.id === job.id && item.account === 'default'));
-    assert.ok(history.some((item: any) => item.id === next.id && item.account === 'e-ready'));
+    assert.ok(history.some((item: any) => item.id === job.id && item.account === undefined));
+    assert.ok(history.some((item: any) => item.id === next.id && item.account === undefined));
     assert.equal(parsed(await f.call('list_jobs', { limit: 1 })).jobs[0].id, next.id);
     assert.equal((await f.call('get_job_status', { account: 'e-ready', job_id: job.id })).isError, true, 'Removed account inputs are rejected');
   } finally { await release?.(); await f.close(); }
@@ -210,7 +216,7 @@ test('session status switches an assumed-exhausted account to a ready account wi
     const cooldown = f.store.imageCooldown();
     const result = parsed(await f.call('session_status'));
     assert.equal(result.status, 'ready');
-    assert.equal(result.account, 'b-ready');
+    assert.equal(result.account, undefined);
     assert.equal(await f.registry.active(), 'b-ready');
     assert.equal(result.errorCode, undefined);
     assert.deepEqual(f.closed, ['a-challenge', 'b-ready']);
@@ -231,7 +237,7 @@ test('session status reselects if the chosen fallback becomes exhausted before i
     };
     const result = parsed(await f.call('session_status'));
     assert.equal(result.status, 'ready');
-    assert.equal(result.account, 'third');
+    assert.equal(result.account, undefined);
     assert.equal(await f.registry.active(), 'third');
     assert.equal(f.calls.length, 0);
     assert.deepEqual(f.closed, ['second', 'third']);
@@ -250,7 +256,7 @@ for (const status of ['challenge', 'login_required', 'unavailable', 'browser_err
         return { status, message: 'Replacement session requires attention.' };
       };
       const result = parsed(await f.call('session_status'));
-      assert.equal(result.account, 'second');
+      assert.equal(result.account, undefined);
       assert.equal(result.status, status === 'browser_error' ? 'unavailable' : status);
       assert.equal(await f.registry.active(), 'second');
       for (const key of ['errorCode', 'error', 'detectedAt', 'retryAfter']) assert.equal(result[key], undefined);
@@ -269,9 +275,9 @@ test('session status reports a locked replacement as busy instead of pretending 
     release = await acquireRuntime(config);
     f.store.recordImageLimit('image_usage_limit', 'Confirmed quota.');
     const result = parsed(await f.call('session_status'));
-    assert.equal(result.account, 'second');
+    assert.equal(result.account, undefined);
     assert.equal(result.status, 'busy');
-    assert.match(result.message, /in use/);
+    assert.deepEqual(result, { status: 'busy' });
     assert.equal(result.errorCode, undefined);
     assert.equal(f.calls.length, 0);
   } finally { await release?.(); await f.close(); }
@@ -284,7 +290,7 @@ test('session status reports an unreadable replacement session without exposing 
     await writeFile(path.join(config.dataDir, 'session-cookies.json'), 'private-invalid-cookie-store');
     f.store.recordImageLimit('image_usage_limit', 'Confirmed quota.');
     const result = parsed(await f.call('session_status'));
-    assert.equal(result.account, 'second');
+    assert.equal(result.account, undefined);
     assert.equal(result.status, 'unavailable');
     assert.equal(result.errorCode, undefined);
     assert.doesNotMatch(JSON.stringify(result), /private-invalid-cookie-store|No other/);
@@ -311,7 +317,7 @@ test('session status switches to a busy replacement promptly without navigating 
       })]);
     } finally { clearTimeout(timer); }
     const result = parsed(response);
-    assert.equal(result.account, 'second');
+    assert.equal(result.account, undefined);
     assert.equal(result.status, 'busy');
     assert.equal(f.calls.length, 1);
     assert.deepEqual(f.closed, []);
@@ -334,8 +340,10 @@ test('batch failover preserves references and continues in the replacement chat'
     const batch = parsed(await f.call('generate_images', { prompts: ['first', 'second', 'third'], reference_images: [reference], aspect_ratio: '3:4' }));
     await rm(reference); release();
     await until(() => f.store.getBatch(batch.id).status === 'completed');
-    const result = parsed(await f.call('get_batch_status', { batch_id: batch.id }));
-    assert.equal(result.account, 'default'); assert.deepEqual(result.jobs.map((job: any) => job.id), batch.jobs.map((job: any) => job.id));
+    const response = parsed(await f.call('get_batch_status', { batch_id: batch.id }));
+    assert.equal(response.status, f.store.getBatch(batch.id).status);
+    const result = f.store.getBatch(batch.id);
+    assert.equal(response.account, undefined); assert.deepEqual(result.jobs.map((job: any) => job.id), batch.jobs.map((job: any) => job.id));
     assert.deepEqual(result.jobs.map((job: any) => job.executionAccount), ['default', 'second', 'second']);
     assert.deepEqual(f.calls.map(({ account, prompt }) => [account, prompt]), [['default', 'first'], ['default', 'second'], ['second', 'second'], ['second', 'third']]);
     assert.equal(f.calls[1]!.options.reuseReferences, true);
@@ -416,7 +424,7 @@ for (const mode of ['disabled', 'timeout'] as const) test(`${mode} requests do n
     assert.equal(await f.registry.active(), 'default');
     if (mode !== 'timeout') {
       const blocked = await f.call('generate_images', { prompts: ['blocked'], reference_images: [path.join(f.dir, 'missing.png')] });
-      assert.equal(blocked.isError, true); assert.equal(parsed(blocked).account, 'default');
+      assert.equal(blocked.isError, true); assert.equal(parsed(blocked).account, undefined);
       assert.equal(parsed(blocked).status, 'blocked');
     } else assert.equal(f.store.imageCooldown(), undefined);
   } finally { await f.close(); }
@@ -561,7 +569,9 @@ for (const references of [false, true]) for (const mandatory of [false, true]) t
     const batch = parsed(await f.call('generate_images', { prompts: ['first', 'second', 'third'], same_chat_mandatory: mandatory,
       aspect_ratio: '16:9', ...(references ? { reference_images: [reference] } : {}) }));
     await until(() => f.store.getBatch(batch.id).status === 'completed');
-    const result = parsed(await f.call('get_batch_status', { batch_id: batch.id }));
+    const response = parsed(await f.call('get_batch_status', { batch_id: batch.id }));
+    assert.equal(response.status, f.store.getBatch(batch.id).status);
+    const result = f.store.getBatch(batch.id);
     assert.equal(result.sameChatMandatory, mandatory); assert.equal(result.attempt, mandatory ? 1 : 0);
     assert.deepEqual(result.jobs.map((job: any) => job.id), batch.jobs.map((job: any) => job.id));
     const expected = [['default', 'first'], ['default', 'second'], ['default', 'third'],

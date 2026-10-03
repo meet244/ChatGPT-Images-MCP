@@ -67,8 +67,7 @@ for (const errorCode of ['free_tier_exhausted', 'image_usage_limit'] as const) t
       const result = await client.callTool({ name, arguments: args });
       assert.equal(result.isError, true);
       const response = parsed(result);
-      assert.equal(response.status, 'blocked'); assert.equal(response.errorCode, errorCode);
-      assert.equal(response.detectedAt, cooldown.detectedAt); assert.equal(response.retryAfter, cooldown.retryAfter);
+      assert.deepEqual(response, { status: 'blocked', error: 'Image usage limit reached.', retryAfter: cooldown.retryAfter });
     }
     const session = parsed(await client.callTool({ name: 'session_status', arguments: {} }));
     assert.equal(session.status, 'usage_limit'); assert.equal(session.retryAfter, cooldown.retryAfter);

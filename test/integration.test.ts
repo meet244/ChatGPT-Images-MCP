@@ -210,14 +210,14 @@ test('current gallery blob images finish without legacy assistant wrappers, and 
       await delay(100); status = parseResult(await client.callTool({ name: 'get_job_status', arguments: { job_id: job.id } }));
     }
     assert.equal(status.status, 'completed', JSON.stringify(status));
-    assert.equal(status.images.length, 1, 'Previous galleries and reference uploads are excluded');
-    assert.deepEqual(await readFile(status.images[0].path), png);
+    assert.equal(store.get(status.id).images!.length, 1, 'Previous galleries and reference uploads are excluded');
+    assert.deepEqual(await readFile(store.get(status.id).images![0]!.path), png);
     observer = await connectChrome(config);
     const page = observer.contexts()[0]!.pages()[0]!;
     assert.equal(await page.locator(config.selectors.assistant).count(), 0);
     assert.equal(await page.evaluate(() => sessionStorage.getItem('streamFinished')), 'yes', 'Hidden stop controls must not mask active streaming');
     await page.locator('#old-gallery').evaluate(el => el.remove());
-    const recovered = await browser.recover(randomUUID(), status.conversationUrl);
+    const recovered = await browser.recover(randomUUID(), store.get(status.id).conversationUrl!);
     assert.equal(recovered.images.length, 1);
     assert.deepEqual(await readFile(recovered.images[0]!.path), png);
     assert.equal(await page.evaluate(() => sessionStorage.getItem('submissions')), '1', 'Recovery must not send another prompt');
@@ -380,8 +380,8 @@ for (const mode of ['playwright', 'cdp', 'webkit'] as const) test(`MCP → queue
     const aspectRatio = mode === 'playwright' ? '1:1' : mode === 'cdp' ? '16:9' : undefined;
     const job = parseResult(await client.callTool({ name: 'generate_image', arguments: { prompt: 'A purple square', reference_images: referencePaths,
       ...(aspectRatio !== undefined ? { aspect_ratio: ` ${aspectRatio.replace(':', ' : ')} ` } : {}) } }));
-    assert.equal(job.aspectRatio, aspectRatio);
-    assert.equal(job.referenceImages.length, 2);
+    assert.equal(store.get(job.id).aspectRatio, aspectRatio);
+    assert.equal(store.get(job.id).referenceImages!.length, 2);
     for (const source of referencePaths) await rm(source);
     let status = job;
     const deadline = Date.now() + 12_000;
@@ -407,9 +407,9 @@ for (const mode of ['playwright', 'cdp', 'webkit'] as const) test(`MCP → queue
     ]);
     assert.equal(audit.uploadFinished, 'yes');
     assert.equal(audit.oldDraftRemoved, 'yes');
-    assert.equal(status.images.length, 1, 'Nested assistant containers should not duplicate images');
-    assert.equal(status.conversationUrl, `${baseUrl}c/fixture-conversation`);
-    assert.deepEqual(await readFile(status.images[0].path), png);
+    assert.equal(store.get(status.id).images!.length, 1, 'Nested assistant containers should not duplicate images');
+    assert.equal(store.get(status.id).conversationUrl!, `${baseUrl}c/fixture-conversation`);
+    assert.deepEqual(await readFile(store.get(status.id).images![0]!.path), png);
     const image = await client.callTool({ name: 'get_image', arguments: { job_id: job.id } });
     assert.equal(image.isError, undefined);
     const preview = (image.content as any[]).find(item => item.type === 'image');
@@ -430,7 +430,7 @@ for (const mode of ['playwright', 'cdp', 'webkit'] as const) test(`MCP → queue
     }
     const uploadFailure = new ChatGPTBrowser(config, { baseUrl: `${baseUrl}upload-failure` });
     try {
-      await assert.rejects(uploadFailure.generate(randomUUID(), 'Do not submit', () => {}, job.referenceImages), /rejected a reference image upload.*No prompt was submitted/);
+      await assert.rejects(uploadFailure.generate(randomUUID(), 'Do not submit', () => {}, store.get(job.id).referenceImages!), /rejected a reference image upload.*No prompt was submitted/);
       assert.equal(await (await uploadFailure.open()).evaluate(() => sessionStorage.getItem('unexpectedReferenceSubmission')), null);
     } finally { await uploadFailure.close(); }
     for (const [route, expected] of [['login', 'login_required'], ['challenge', 'challenge'], ['challenge-title', 'challenge']]) {

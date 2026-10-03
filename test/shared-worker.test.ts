@@ -62,7 +62,7 @@ test('an empty MCP worker stays account-free until an account is explicitly adde
     await call('add_account', { account: 'work' });
     assert.deepEqual((await registry.list()).accounts.map(account => account.account), ['work']);
     const admitted = parsed(await call('generate_image', { prompt: 'explicit account' }));
-    assert.equal(admitted.account, 'work');
+    assert.equal(await registry.owner(admitted.id), 'work');
     await until(async () => parsed(await call('get_job_status', { job_id: admitted.id })).status === 'completed');
     assert.deepEqual(generated, ['work']);
   } finally { await connection.client.close(); await worker.close(); }
@@ -105,7 +105,7 @@ test('simultaneous stdio clients start one worker, discover eleven tools, and sh
     assert.equal(image.path, imagePath);
     const waited = parsed(await second.client.callTool({ name: 'wait_for_job', arguments: { job_id: job.id, include_preview: false } }));
     assert.equal(waited.status, 'completed');
-    assert.equal(waited.image.path, imagePath);
+    assert.deepEqual(Object.keys(waited).sort(), ['status', 'updatedAt']);
     await second.client.close();
     await until(async () => !await lockfile.check(config.dataDir, { stale: 30_000 }));
     await assert.rejects(readFile(path.join(dir, 'worker.json')), { code: 'ENOENT' });

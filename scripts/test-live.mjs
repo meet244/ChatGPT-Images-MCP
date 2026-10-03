@@ -66,7 +66,7 @@ try {
   while (['queued', 'running'].includes(status.status)) {
     if (status.status !== lastStatus) { console.log(`Status: ${status.status}`); lastStatus = status.status; }
     if (Date.now() > deadline) throw new LiveTestError(`Test timed out. Check job ${job.id} and its ChatGPT conversation before submitting again.`);
-    status = await call('wait_for_job', { job_id: job.id, include_preview: false });
+    status = await call('wait_for_job', { job_id: job.id });
   }
   if (status.status !== 'completed') throw new LiveTestError(`Job ${job.id} ${status.status}: ${status.error || 'Check its ChatGPT conversation.'}`);
   const image = await call('get_image', { job_id: job.id, include_preview: false });
@@ -74,7 +74,6 @@ try {
   if (!metadata.width || !metadata.height) throw new LiveTestError('The saved result is not a readable image.');
   console.log(`Image saved: ${image.path}`);
   console.log(`Image size: ${metadata.width} × ${metadata.height}`);
-  console.log(`Conversation: ${image.conversationUrl}`);
   console.log('Live MCP image test passed.');
 } catch (error) {
   console.error(error instanceof LiveTestError ? error.message : 'MCP test failed. Check the server diagnostics above; no automatic retry was made.');

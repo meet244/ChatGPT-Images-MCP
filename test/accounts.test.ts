@@ -144,26 +144,27 @@ test('stdio clients share server-selected queues and retrieve/cancel jobs across
     const legacy = parsed(await first.call('generate_image', { prompt: 'hold default' }));
     const pending = parsed(await second.call('generate_image', { prompt: 'cancel default' }));
     const batch = parsed(await first.call('generate_images', { prompts: ['batch one', 'batch two'] }));
-    assert.equal(legacy.account, 'default');
+    assert.equal(await registry.owner(legacy.id), 'default');
     assert.equal(parsed(await first.call('session_status')).status, 'busy');
     await registry.use('work'); // Simulate the persisted selection changed by the worker, without a public tool input.
-    assert.equal(parsed(await first.call('session_status')).account, 'work');
+    assert.deepEqual(parsed(await first.call('session_status')), { status: 'busy' });
     const work = parsed(await second.call('generate_image', { prompt: 'hold work' }));
     const workSecond = parsed(await first.call('generate_image', { prompt: 'work second' }));
     const workThird = parsed(await second.call('generate_image', { prompt: 'work third' }));
     assert.deepEqual(openings.sort(), ['default', 'work'], 'Concurrent clients must share a single runtime per account');
     assert.deepEqual(calls, [{ account: 'default', prompt: 'hold default' }], 'Another account waits instead of opening a simultaneous browser');
-    assert.equal(parsed(await first.call('get_job_status', { job_id: pending.id })).account, 'default');
+    assert.equal(parsed(await first.call('get_job_status', { job_id: pending.id })).account, undefined);
+    assert.equal(await registry.owner(pending.id), 'default');
     assert.equal(parsed(await first.call('cancel_job', { job_id: pending.id })).status, 'cancelled');
-    assert.equal(parsed(await second.call('get_batch_status', { batch_id: batch.id })).account, 'default');
-    assert.equal(parsed(await first.call('wait_for_job', { job_id: legacy.id, wait_seconds: 0 })).account, 'default');
+    assert.equal(parsed(await second.call('get_batch_status', { batch_id: batch.id })).account, undefined);
+    assert.equal(parsed(await first.call('wait_for_job', { job_id: legacy.id, wait_seconds: 0 })).account, undefined);
     assert.equal((await first.call('get_job_status', { account: 'work', job_id: legacy.id })).isError, true);
     assert.equal((await first.call('generate_image', { account: 'missing', prompt: 'never sent' })).isError, true);
     assert.equal((await first.call('add_account', { account: '../escape' })).isError, true);
     assert.equal((await first.call('add_account', { account: 'work' })).isError, true);
     const history = parsed(await first.call('list_jobs')).jobs;
-    assert.ok(history.some((job: any) => job.account === 'work'));
-    assert.ok(history.some((job: any) => job.account === 'default'));
+    assert.ok(history.some((job: any) => job.id === work.id));
+    assert.ok(history.some((job: any) => job.id === legacy.id));
     assert.equal(parsed(await first.call('list_jobs', { limit: 1 })).jobs.length, 1);
     releases[0]!();
     await until(async () => releases.length === 2);
@@ -172,10 +173,11 @@ test('stdio clients share server-selected queues and retrieve/cancel jobs across
     await until(async () => parsed(await first.call('get_batch_status', { batch_id: batch.id })).status === 'completed');
     assert.deepEqual(calls.filter(call => call.account === 'work').map(call => call.prompt), ['hold work', 'work second', 'work third']);
     assert.deepEqual(calls.filter(call => call.account === 'default').map(call => call.prompt), ['hold default', 'batch one', 'batch two']);
-    assert.equal(parsed(await first.call('get_image', { job_id: legacy.id, include_preview: false })).account, 'default');
+    assert.equal(parsed(await first.call('get_image', { job_id: legacy.id, include_preview: false })).account, undefined);
     const finished = parsed(await second.call('wait_for_job', { job_id: workSecond.id, include_preview: false }));
-    assert.equal(finished.account, 'work');
-    assert.ok(finished.image.path.startsWith(path.join(dir, 'accounts/work/images')));
+    assert.deepEqual(Object.keys(finished).sort(), ['status', 'updatedAt']);
+    const finishedImage = parsed(await second.call('get_image', { job_id: workSecond.id, include_preview: false }));
+    assert.ok(finishedImage.path.startsWith(path.join(dir, 'accounts/work/images')));
     assert.equal((await first.call('get_image', { job_id: work.id })).content.some(item => item.type === 'image'), true);
     const detached = parsed(await first.call('generate_image', { prompt: 'hold detached' }));
     const afterDetach = parsed(await second.call('generate_image', { prompt: 'after detach' }));
@@ -229,9 +231,9 @@ test('cooldowns stay with their account across switching and worker restarts', {
     assert.equal(cooldown.status, 'usage_limit');
     await saveCookies(secondConfig.dataDir, cookies('second-fixture-secret'));
     const ready = parsed(await connection.call('session_status'));
-    assert.equal(ready.status, 'ready'); assert.equal(ready.account, 'second');
+    assert.equal(ready.status, 'ready'); assert.equal(ready.account, undefined);
     const allowed = parsed(await connection.call('generate_image', { prompt: 'second account' }));
-    assert.equal(allowed.account, 'second');
+    assert.equal(await registry.owner(allowed.id), 'second');
     await until(async () => parsed(await connection.call('get_job_status', { job_id: allowed.id })).status === 'completed');
     const limitedSecond = parsed(await connection.call('generate_image', { prompt: 'limit second account' }));
     await until(async () => parsed(await connection.call('get_job_status', { job_id: limitedSecond.id })).status === 'failed');
@@ -239,7 +241,7 @@ test('cooldowns stay with their account across switching and worker restarts', {
     const blocked = await connection.call('generate_images', { prompts: ['blocked'], reference_images: [path.join(dir, 'missing.png')] });
     assert.equal(blocked.isError, true);
     assert.equal(JSON.parse((blocked.content[0] as any).text).retryAfter, secondCooldown.retryAfter);
-    assert.equal(JSON.parse((blocked.content[0] as any).text).account, 'second');
+    assert.equal(JSON.parse((blocked.content[0] as any).text).account, undefined);
     const original = await registry.inspectDatabase('default', db => JSON.parse((db.prepare("SELECT body FROM settings WHERE key = 'image_cooldown'").get() as { body: string }).body));
     assert.equal(original.retryAfter, cooldown.retryAfter);
     assert.equal(calls, 3);
@@ -250,7 +252,7 @@ test('cooldowns stay with their account across switching and worker restarts', {
     const restored = parsed(await connection.call('session_status'));
     assert.equal(restored.retryAfter, secondCooldown.retryAfter);
     assert.equal(calls, 3, 'Restart and switching never replay failed jobs');
-    assert.equal(parsed(await connection.call('get_job_status', { job_id: limited.id })).account, 'default');
+    assert.equal(await registry.owner(limited.id), 'default');
   } finally { await connection.client.close(); await worker.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -280,11 +282,10 @@ test('named profiles resume queued jobs on worker startup and respect standalone
     const lockedResult = await connection.call('session_status');
     assert.equal(lockedResult.isError, undefined);
     assert.equal(parsed(lockedResult).status, 'busy');
-    assert.equal(parsed(lockedResult).account, 'login');
-    assert.match(JSON.stringify(lockedResult.content), /Account 'login' is in use/);
+    assert.deepEqual(parsed(lockedResult), { status: 'busy' });
     await release();
     const unlocked = parsed(await connection.call('list_jobs'));
-    assert.ok(unlocked.jobs.some((job: any) => job.id === queued.id && job.account === 'second'));
+    assert.ok(unlocked.jobs.some((job: any) => job.id === queued.id && job.account === undefined));
   } finally { await release().catch(() => {}); await connection.client.close(); await worker.close(); await rm(dir, { recursive: true, force: true }); }
 });
 

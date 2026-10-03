@@ -49,7 +49,7 @@ async function fixture() {
   } };
 }
 
-test('wait returns the completed image, allows concurrent tools, and can be repeated without generation', { timeout: 5000 }, async () => {
+test('wait returns only status and updatedAt, allows concurrent tools, and can be repeated without generation', { timeout: 5000 }, async () => {
   const f = await fixture();
   try {
     const tools = await f.client.listTools();
@@ -69,16 +69,16 @@ test('wait returns the completed image, allows concurrent tools, and can be repe
     f.releases[0]!();
     const result = await waiting;
     const completed = parsed(result);
-    assert.equal(completed.id, job.id);
-    assert.equal(completed.status, 'completed');
-    assert.deepEqual(completed.image, { image_index: 0, ...f.artifact });
-    const preview = result.content.find(item => item.type === 'image')!;
+    assert.deepEqual(completed, { status: 'completed', updatedAt: f.store.get(job.id).updatedAt });
+    assert.equal(result.content.length, 1, 'Waiting never returns an image preview');
+    const image = await f.call('get_image', { job_id: job.id });
+    const preview = image.content.find(item => item.type === 'image')!;
     assert.equal(preview.type, 'image');
     const metadata = await sharp(Buffer.from(preview.data, 'base64')).metadata();
     assert.equal(metadata.width, 1024); assert.equal(metadata.height, 768);
     const repeated = await f.call('wait_for_job', { job_id: job.id, image_index: 1, include_preview: false });
     assert.equal(repeated.content.length, 1);
-    assert.equal(parsed(repeated).image.image_index, 1);
+    assert.deepEqual(parsed(repeated), completed);
     assert.deepEqual(f.calls, ['first']);
   } finally { await f.close(); }
 });
@@ -94,7 +94,7 @@ test('wait expiry returns running or queued batch jobs without failing or resubm
     assert.ok(performance.now() - started >= 950, 'Pending calls must actually wait for the requested duration');
     assert.equal(parsed(results[0]).status, 'running');
     assert.equal(parsed(results[1]).status, 'queued');
-    assert.equal(parsed(results[1]).id, batch.jobs[0].id);
+    assert.equal(parsed(results[1]).updatedAt, f.store.get(batch.jobs[0].id).updatedAt);
     assert.equal(f.store.get(job.id).status, 'running');
     assert.equal(f.store.get(batch.jobs[0].id).status, 'queued');
     assert.equal(parsed(await f.call('wait_for_job', { job_id: job.id, wait_seconds: 0 })).status, 'running');
@@ -110,14 +110,14 @@ test('failed/cancelled waits return immediately, and invalid waits do not admit 
       const job = f.store.create(status);
       f.store.update(job.id, { status, error: 'Expected terminal state' });
       const result = parsed(await f.call('wait_for_job', { job_id: job.id }));
-      assert.equal(result.status, status); assert.equal(result.error, 'Expected terminal state');
+      assert.equal(result.status, status); assert.equal(result.error, status === 'failed' ? 'Expected terminal state' : undefined);
     }
     const completed = f.store.create('Completed earlier');
     f.store.update(completed.id, { status: 'completed', images: [f.artifact] });
     for (const args of [
       { job_id: randomUUID() }, { job_id: 'not-a-job' },
       ...[-1, 26, 0.5, '25'].map(wait_seconds => ({ job_id: completed.id, wait_seconds })),
-      { job_id: completed.id, image_index: 3 }, { job_id: completed.id, image_index: -1 },
+      { job_id: completed.id, image_index: -1 },
       { job_id: completed.id, include_preview: 'false' },
     ]) assert.equal((await f.call('wait_for_job', args)).isError, true);
     assert.deepEqual(f.calls, []);
