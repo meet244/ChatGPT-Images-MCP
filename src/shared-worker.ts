@@ -169,7 +169,7 @@ export async function startSharedWorker(config: Config, options: { browser?: Cha
       await rename(temporary, endpointFile(config));
     } finally { await rm(temporary, { force: true }); }
     listener.on('error', () => { void close(); });
-    queue.kick();
+    if ((await accounts.registry.names()).includes('default')) queue.kick();
     // Give the launching client time to attach; afterwards idle workers exit promptly.
     scheduleIdle(5000);
     return { close, done };
@@ -178,10 +178,12 @@ export async function startSharedWorker(config: Config, options: { browser?: Cha
 
 export async function runSharedStdio(config: Config): Promise<void> {
   const registry = new AccountRegistry(config);
-  const selected = await registry.require(await registry.active());
+  const account = await registry.active();
+  const selected = account ? await registry.require(account) : undefined;
   // Preserve interactive setup, but never acquire the worker's runtime lock merely
   // to establish a second MCP connection. Protocol clients never get terminal prompts.
-  if (process.stdin.isTTY && !await lockfile.check(selected.dataDir, { stale: 30_000 })) {
+  if (!selected) console.error('No accounts configured. Run npm run accounts:manage to add one.');
+  else if (process.stdin.isTTY && !await lockfile.check(selected.dataDir, { stale: 30_000 })) {
     const release = await acquireRuntime(selected);
     const browser = new ChatGPTBrowser(selected);
     try {

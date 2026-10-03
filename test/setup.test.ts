@@ -1,7 +1,9 @@
+import './support/headless.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { PassThrough, Writable } from 'node:stream';
+import { createServer } from 'node:http';
 import type { ReadStream } from 'node:tty';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,7 +11,8 @@ import { parseCookieInput, hasSessionCookies, type BrowserCookie } from '../src/
 import { readSavedCookies, saveCookies } from '../src/session-store.js';
 import { readCookieInput } from '../src/terminal.js';
 import { setupSession, importCookiesWithVerification, type SetupBrowser, type SetupTerminal } from '../src/setup.js';
-import { BrowserError } from '../src/browser.js';
+import { BrowserError, ChatGPTBrowser } from '../src/browser.js';
+import { loadConfig } from '../src/config.js';
 
 const paste = '__Secure-next-auth.session-token.0 = fake-part-0\n\n__Secure-next-auth.session-token.1 = fake-part-1';
 const tableRow = (name: string, value: string, domain = '.chatgpt.com', expiry = 'Session', site = 'Lax') =>
@@ -157,6 +160,7 @@ function setupFixture(saved: boolean, answers: string[]) {
     importCookieValues: async cookies => { imported = cookies; return cookies.length; },
     setHeadless: async value => { headless.push(value); },
     open: async () => { opened = true; return {} as any; },
+    closeAfterSetup: async () => {},
   };
   const io: SetupTerminal = {
     question: async prompt => { messages.push(prompt); return answers.shift() ?? ''; },
@@ -228,6 +232,89 @@ test('confirmed signed-out sessions still offer the two authorized setup choices
 });
 
 
+test('cookie verification closes automatically before controlled session checks', async () => {
+  const fixture = setupFixture(false, ['2']);
+  const events: string[] = [];
+  let release!: () => void;
+  const exited = new Promise<void>(resolve => { release = resolve; });
+  fixture.browser.prepareManualCookieSession = async cookies => ({
+    count: cookies.length, autoCloseMs: 15,
+    close: async () => { events.push('close'); release(); },
+    waitForExit: async () => { await exited; events.push('exit'); },
+  });
+  fixture.browser.sessionStatus = async () => { events.push('check'); return { status: 'ready', message: 'Ready' }; };
+  fixture.browser.closeAfterSetup = async () => { events.push('controlled-close'); };
+  assert.equal((await setupSession(fixture.browser, false, fixture.io)).status, 'ready');
+  assert.deepEqual(events, ['close', 'exit', 'check', 'controlled-close']);
+  assert.match(fixture.messages.join('\n'), /close automatically/);
+});
+
+test('the reopened setup window gets its full interval even when manual Chrome exits immediately', async () => {
+  for (const autoCloseMs of [undefined, 0, 10_000, 120_000]) {
+    const fixture = setupFixture(false, []);
+    const events: string[] = [];
+    fixture.browser.prepareManualCookieSession = async cookies => ({
+      count: cookies.length, autoCloseMs,
+      close: async () => { assert.fail('Manual Chrome already exited'); },
+      waitForExit: async () => { events.push('manual-exited'); },
+    });
+    fixture.browser.sessionStatus = async (navigate, settleMs) => {
+      assert.equal(navigate, true);
+      assert.equal(settleMs, autoCloseMs || 10_000);
+      events.push('controlled-check');
+      return { status: 'ready', message: 'Ready' };
+    };
+    fixture.browser.closeAfterSetup = async () => { events.push('controlled-close'); };
+    await importCookiesWithVerification(fixture.browser, parseCookieInput(paste), fixture.io);
+    assert.deepEqual(events, ['manual-exited', 'controlled-check', 'controlled-close']);
+    assert.match(fixture.messages.join('\n'), /Controlled Chrome will stay open for at least/);
+  }
+});
+
+test('setup checks readiness after the reopened browser verification interval', { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'images-setup-wait-'));
+  const server = createServer((_req, res) => {
+    res.setHeader('content-type', 'text/html');
+    res.end(`<body>Verify you are human<script>
+      setTimeout(() => { document.body.innerHTML = '<div contenteditable="true" role="textbox"></div>'; }, 100);
+    </script>`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}/`;
+  const browser = new ChatGPTBrowser(loadConfig({ CHATGPT_DATA_DIR: directory, CHATGPT_BROWSER_MODE: 'playwright', CHATGPT_HEADLESS: 'true' }), { baseUrl });
+  try {
+    await browser.open();
+    const started = Date.now();
+    const state = await browser.sessionStatus(false, 200);
+    assert.ok(Date.now() - started >= 190, 'The verification interval must finish before readiness is checked');
+    assert.equal(state.status, 'ready');
+  } finally {
+    await browser.close();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('manual exit cancels automatic closing, and closure errors retain cookies without a controlled reconnect', async () => {
+  const fixture = setupFixture(false, ['2']);
+  let closes = 0;
+  fixture.browser.prepareManualCookieSession = async cookies => ({
+    count: cookies.length, autoCloseMs: 15,
+    close: async () => { closes++; }, waitForExit: async () => {},
+  });
+  await setupSession(fixture.browser, false, fixture.io);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(closes, 0);
+  const failed = setupFixture(false, ['2']);
+  failed.browser.prepareManualCookieSession = async cookies => ({
+    count: cookies.length, autoCloseMs: 1,
+    close: async () => { throw new Error('Could not close verification Chrome'); },
+    waitForExit: async () => new Promise<void>(() => {}),
+  });
+  failed.browser.sessionStatus = async () => { assert.fail('Must not reconnect before Chrome exits'); };
+  await assert.rejects(setupSession(failed.browser, false, failed.io), /Could not close/);
+});
+
 test('cookie setup opens manual Chrome and waits for its exit before controlled session checks', async () => {
   const fixture = setupFixture(false, ['2']);
   const events: string[] = [];
@@ -267,4 +354,22 @@ test('alternative browser engines retain their direct import and session check',
   assert.equal(result.count, 2);
   assert.equal(result.state.status, 'ready');
   assert.equal(fixture.imported().length, 2);
+});
+
+test('the session browser closes after unsuccessful or throwing readiness checks too', async () => {
+  for (const throws of [false, true]) {
+    const fixture = setupFixture(false, []);
+    const events: string[] = [];
+    fixture.browser.sessionStatus = async () => {
+      events.push('check');
+      if (throws) throw new BrowserError('Fixture session unavailable');
+      return { status: 'challenge', message: 'Fixture verification required' };
+    };
+    fixture.browser.closeAfterSetup = async () => { events.push('closed'); };
+    const pending = importCookiesWithVerification(fixture.browser, parseCookieInput(paste), fixture.io);
+    if (throws) await assert.rejects(pending, /Fixture session unavailable/);
+    else assert.equal((await pending).state.status, 'challenge');
+    assert.deepEqual(events, ['check', 'closed']);
+    assert.equal(fixture.imported().length, 2);
+  }
 });

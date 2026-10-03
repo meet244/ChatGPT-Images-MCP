@@ -14,6 +14,7 @@ import { readCookieInput } from './terminal.js';
 import { setupSession, importCookiesWithVerification } from './setup.js';
 import { openManualChrome, stopChrome } from './chrome.js';
 import { AccountRegistry } from './accounts.js';
+import { manageAccounts } from './account-menu.js';
 
 const help = `ChatGPT Images MCP (local browser, no OpenAI API)
 
@@ -30,8 +31,9 @@ Commands:
   generate --prompt TEXT    Generate an image from the terminal and print saved paths
   recover --job ID           Save a finished image from an existing failed job's conversation
   accounts                  List profiles and the selected account (no browser opened)
+  manage-accounts           Interactive account menu: cookies, names, priorities, selection
   account-add --account NAME Create an empty profile; then run setup --account NAME
-  account-use --account NAME Select the default account for new requests
+  account-use --account NAME Manually prefer an account until priority mode is restored
   config                    Print MCP client configuration with absolute paths
 
 Options:
@@ -42,7 +44,7 @@ Options:
 
 Settings: .env in the project directory; see .env.example.
 Disconnect clients using an account before modifying its session; each profile has its own runtime lock.
-serve always connects to the shared worker; choose accounts with use_account or per-tool account inputs.
+serve always connects to the shared worker; account selection and failover are handled by the server.
 `;
 
 async function main(): Promise<void> {
@@ -51,20 +53,26 @@ async function main(): Promise<void> {
   }, allowPositionals: true });
   if (values.help) { console.log(help); return; }
   const command = positionals[0] ?? 'serve';
-  if (positionals.length > 1 || !['serve', 'worker', 'browser', 'browser-manual', 'browser-close', 'setup', 'paste-cookies', 'login', 'import-cookies', 'status', 'generate', 'recover', 'config', 'accounts', 'account-add', 'account-use'].includes(command)) throw new Error(help);
+  if (positionals.length > 1 || !['serve', 'worker', 'browser', 'browser-manual', 'browser-close', 'setup', 'paste-cookies', 'login', 'import-cookies', 'status', 'generate', 'recover', 'config', 'accounts', 'manage-accounts', 'account-add', 'account-use'].includes(command)) throw new Error(help);
   const baseConfig = loadConfig();
   const registry = new AccountRegistry(baseConfig);
   if (['account-add', 'account-use'].includes(command)) {
     if (!values.account) throw new Error(`Usage: ${command} --account NAME`);
     if (command === 'account-add') {
       await registry.add(values.account);
-      console.log(JSON.stringify({ account: values.account, status: 'login_required', message: `Run npm run setup -- --account ${values.account} to sign in or paste cookies in the terminal. Then select it with account-use --account ${values.account}.` }, null, 2));
-    } else console.log(JSON.stringify(await registry.use(values.account), null, 2));
+      console.log(JSON.stringify({ account: values.account, status: 'login_required', message: `Run npm run setup -- --account ${values.account} to sign in or paste cookies in the terminal. The server can then select it automatically.` }, null, 2));
+    } else { await registry.select(values.account); console.log(JSON.stringify({ account: values.account, selection_mode: 'manual' }, null, 2)); }
     return;
   }
   if (command === 'accounts') { console.log(JSON.stringify(await registry.list(), null, 2)); return; }
+  if (command === 'manage-accounts') {
+    if (!process.stdin.isTTY) throw new Error('Run npm run accounts:manage in an interactive terminal.');
+    if (values.account) throw new Error('Choose an account inside the interactive menu.');
+    await manageAccounts(registry);
+    return;
+  }
   const sharedCommand = ['serve', 'worker', 'config'].includes(command);
-  if (sharedCommand && values.account) throw new Error('serve/config use one shared worker for all accounts. Choose an account with account-use --account NAME or an MCP tool account argument.');
+  if (sharedCommand && values.account) throw new Error('serve/config use one shared worker that selects accounts automatically. The --account flag is for terminal session, setup, and maintenance commands.');
   if (command === 'recover' && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(values.job ?? '')) throw new Error('Usage: recover --job JOB_ID');
   const account = sharedCommand ? 'default' : values.account ?? (command === 'recover' ? await registry.owner(values.job!) : await registry.active());
   const config = sharedCommand ? baseConfig : await registry.require(account);
@@ -86,7 +94,8 @@ async function main(): Promise<void> {
   }
   console.error(`Account: ${account}`);
   const release = await acquireRuntime(config);
-  const browser = new ChatGPTBrowser(config);
+  let browser = new ChatGPTBrowser(config);
+  let releaseExecution: (() => Promise<void>) | undefined;
   let store: JobStore | undefined;
   let queue: JobQueue | undefined;
   let cleanupPromise: Promise<void> | undefined;
@@ -96,6 +105,7 @@ async function main(): Promise<void> {
     await browser.close().catch(() => {});
     await stopped;
     store?.close();
+    await releaseExecution?.();
     await release();
   })();
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { void cleanup().finally(() => process.exit(0)); });
@@ -134,12 +144,23 @@ async function main(): Promise<void> {
       if (job.status === 'completed') console.log(JSON.stringify(job, null, 2));
       else {
         if (job.status !== 'failed' || !job.conversationUrl) throw new Error('Recovery requires a failed/interrupted job with a recorded conversation. Stop the current test/server first.');
+        if (job.executionAccount && job.executionAccount !== account) {
+          const executionConfig = await registry.require(job.executionAccount);
+          if (values.headed) executionConfig.headless = false;
+          releaseExecution = await acquireRuntime(executionConfig);
+          browser = new ChatGPTBrowser(executionConfig);
+          console.error(`Recovering from execution account: ${job.executionAccount}`);
+        }
         console.error(`Recovering existing image for job ${job.id}; no new prompt will be submitted.`);
-        const result = await browser.recover(job.id, job.conversationUrl);
+        const generationId = job.batchAttempt ? `${job.id}-attempt-${job.batchAttempt}` : job.id;
+        const result = await browser.recover(generationId, job.conversationUrl);
         console.log(JSON.stringify(store.update(job.id, { status: 'completed', ...result, error: undefined }), null, 2));
       }
     } else if (command === 'status') {
-      console.log(JSON.stringify(await browser.sessionStatus(), null, 2));
+      let state;
+      try { state = await browser.sessionStatus(); }
+      finally { await browser.shutdown(); }
+      console.log(JSON.stringify(state, null, 2));
     } else {
       store = new JobStore(config.dataDir);
       queue = new JobQueue(store, browser);

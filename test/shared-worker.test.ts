@@ -1,3 +1,4 @@
+import './support/headless.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
@@ -13,8 +14,9 @@ import { loadConfig, projectRoot } from '../src/config.js';
 import { ChatGPTBrowser } from '../src/browser.js';
 import { JobStore } from '../src/store.js';
 import { startSharedWorker } from '../src/shared-worker.js';
+import { AccountRegistry } from '../src/accounts.js';
 
-const names = ['add_account', 'cancel_job', 'generate_image', 'generate_images', 'get_batch_status', 'get_image', 'get_job_status', 'list_accounts', 'list_jobs', 'session_status', 'use_account', 'wait_for_job'];
+const names = ['add_account', 'cancel_job', 'generate_image', 'generate_images', 'get_batch_status', 'get_image', 'get_job_status', 'list_accounts', 'list_jobs', 'session_status', 'wait_for_job'];
 function clientFor(dir: string) {
   const client = new Client({ name: 'shared-worker-test', version: '1' });
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(projectRoot, 'dist/index.js'), 'serve'],
@@ -35,7 +37,45 @@ async function until(predicate: () => boolean | Promise<boolean>): Promise<void>
   }
 }
 
-test('simultaneous stdio clients start one worker, discover twelve tools, and share saved images', { timeout: 15_000 }, async () => {
+test('an empty MCP worker stays account-free until an account is explicitly added, including after deletion', { timeout: 15_000 }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'images-worker-empty-'));
+  const config = loadConfig({ CHATGPT_DATA_DIR: dir });
+  const registry = new AccountRegistry(config);
+  const generated: string[] = [];
+  const worker = await startSharedWorker(config, { browserFactory: (config, account) => {
+    const browser = new ChatGPTBrowser(config);
+    browser.generate = async () => { generated.push(account); return { images: [], conversationUrl: 'https://chatgpt.com/c/fixture' }; };
+    return browser;
+  } });
+  const connection = clientFor(dir);
+  try {
+    await connection.client.connect(connection.transport);
+    const call = (name: string, args: object = {}) => connection.client.callTool({ name, arguments: args });
+    assert.deepEqual(parsed(await call('list_accounts')).accounts, []);
+    const status = parsed(await call('session_status'));
+    assert.equal(status.status, 'login_required');
+    assert.match(status.message, /No accounts configured/);
+    const rejected = await call('generate_image', { prompt: 'do not generate' });
+    assert.equal(rejected.isError, true);
+    assert.match(JSON.stringify(rejected.content), /No accounts configured/);
+    assert.deepEqual(await registry.names(), []);
+    await call('add_account', { account: 'work' });
+    assert.deepEqual((await registry.list()).accounts.map(account => account.account), ['work']);
+    const admitted = parsed(await call('generate_image', { prompt: 'explicit account' }));
+    assert.equal(admitted.account, 'work');
+    await until(async () => parsed(await call('get_job_status', { job_id: admitted.id })).status === 'completed');
+    assert.deepEqual(generated, ['work']);
+  } finally { await connection.client.close(); await worker.close(); }
+  try {
+    await registry.remove('work');
+    const restarted = await startSharedWorker(config);
+    try { assert.deepEqual(await registry.names(), []); }
+    finally { await restarted.close(); }
+    assert.deepEqual(await new AccountRegistry(config).names(), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('simultaneous stdio clients start one worker, discover eleven tools, and share saved images', { timeout: 15_000 }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-worker-start-'));
   const config = loadConfig({ CHATGPT_DATA_DIR: dir });
   const seed = new JobStore(dir);
@@ -79,6 +119,7 @@ test('simultaneous stdio clients start one worker, discover twelve tools, and sh
 test('clients share one FIFO browser queue; accepted jobs finish after both clients disconnect', { timeout: 15_000 }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-worker-queue-'));
   const config = loadConfig({ CHATGPT_DATA_DIR: dir });
+  await new AccountRegistry(config).add('default');
   const browser = new ChatGPTBrowser(config);
   let releaseFirst!: () => void, releaseSecond!: () => void;
   const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });

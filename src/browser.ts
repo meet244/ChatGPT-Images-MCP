@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { chmod, mkdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, webkit, type Browser, type BrowserContext, type Page, type Locator } from 'playwright';
 import sharp from 'sharp';
@@ -7,7 +7,7 @@ import type { Config } from './config.js';
 import { readCookies, normalizeCookies, hasSessionCookies, type BrowserCookie } from './cookies.js';
 import { readSavedCookies, saveCookies } from './session-store.js';
 import type { ImageArtifact } from './store.js';
-import { connectChrome, ChromeError, seedManualChromeCookies, openManualChrome } from './chrome.js';
+import { connectChrome, ChromeError, chromeProfile, runningChrome, finishManualChrome, seedManualChromeCookies, openManualChrome, stopChrome, type ManualChromeHandle } from './chrome.js';
 import { generationLimitNotice, type GenerationLimitNotice } from './limits.js';
 
 export type SessionStatus = { status: 'ready' | 'login_required' | 'challenge' | 'unavailable'; message: string };
@@ -19,10 +19,14 @@ const stopButtons = 'button[data-testid="stop-button"], button[aria-label="Stop 
 const userMessages = '[data-message-author-role="user"], [data-turn="user"]';
 export interface GenerationResult { conversationUrl: string; images: ImageArtifact[]; }
 export interface GenerationOptions { conversationUrl?: string; reuseReferences?: boolean; allowConversationRollover?: boolean; aspectRatio?: string; }
-export interface ManualCookieSetup { count: number; pid?: number; waitForExit(): Promise<void>; }
+export interface ManualCookieSetup { count: number; pid?: number; autoCloseMs?: number; close?(): Promise<void>; waitForExit(): Promise<void>; }
 /** Messages are safe to show publicly; raw browser exceptions stay inside the adapter. */
 export class BrowserError extends Error {
   constructor(message: string, readonly code?: 'free_tier_exhausted' | 'image_usage_limit', readonly resetText?: string) { super(message); }
+}
+/** A completed response with no image, rather than an uncertain submission or timeout. */
+export class TextOnlyResponseError extends BrowserError {
+  constructor() { super('ChatGPT finished with a text response but no generated image. Check the conversation for a refusal, usage limit, or unavailable image tool.'); }
 }
 class ConversationFullError extends BrowserError {
   constructor() { super('ChatGPT explicitly reported that this conversation is full.'); }
@@ -34,24 +38,40 @@ export class ChatGPTBrowser {
   private page?: Page;
   private starting?: Promise<Page>;
   private manualHandoff = false;
+  private manualChrome?: ManualChromeHandle;
   private readonly baseUrl: string;
   constructor(private config: Config, options: { baseUrl?: string } = {}) {
     this.baseUrl = options.baseUrl ?? 'https://chatgpt.com/';
   }
 
-  private async start(): Promise<Page> {
+  private async start(manualWarmup = true): Promise<Page> {
     if (this.page && !this.page.isClosed()) return this.page;
     if (this.starting) return this.starting;
-    this.starting = this.launch();
+    this.starting = this.launch(manualWarmup);
     try { return await this.starting; } finally { this.starting = undefined; }
   }
 
-  private async launch(): Promise<Page> {
+  private async launch(manualWarmup: boolean): Promise<Page> {
     await this.closeConnection();
     const profile = path.join(this.config.dataDir, this.config.browserMode === 'webkit' ? 'webkit-profile' : 'browser-profile');
     await mkdir(profile, { recursive: true, mode: 0o700 });
     try {
       if (this.config.browserMode === 'cdp') {
+        if (manualWarmup && !this.manualHandoff && !await runningChrome(this.config) && await this.hasSavedSession()) {
+          // A fresh generation/session browser follows the ordinary Chrome stage
+          // used during cookie setup, with the same persistent account profile.
+          let hasProfile = false;
+          try { hasProfile = (await stat(chromeProfile(this.config))).isDirectory(); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+          if (!hasProfile || this.config.cookiesFile) {
+            const cookies = this.config.cookiesFile ? await readCookies(this.config.cookiesFile) : await readSavedCookies(this.config.dataDir);
+            await seedManualChromeCookies(this.config, cookies);
+          }
+          this.manualChrome = await openManualChrome(this.config, { urls: [this.baseUrl] });
+          await finishManualChrome(this.manualChrome, this.config.manualCloseMs);
+          this.manualChrome = undefined;
+          this.manualHandoff = true;
+        }
         this.connection = await connectChrome(this.config);
         this.context = this.connection.contexts()[0];
         if (!this.context) throw new Error('Dedicated Chrome has no default browser context.');
@@ -79,7 +99,11 @@ export class ChatGPTBrowser {
       if (missing.length) await this.context.addCookies(missing);
       const origin = new URL(this.baseUrl).origin;
       this.page = this.context.pages().find(page => { try { return new URL(page.url()).origin === origin; } catch { return false; } })
-        ?? this.context.pages().find(page => page.url() === 'about:blank') ?? await this.context.newPage();
+        ?? this.context.pages().find(page => page.url() === 'about:blank') ?? this.context.pages()[0] ?? await this.context.newPage();
+      if (this.config.browserMode === 'cdp') {
+        // This is our dedicated profile: keep one tab even if Chrome restored old windows.
+        for (const extra of this.context.pages()) if (extra !== this.page) await extra.close();
+      }
       return this.page;
     } catch (error) {
       await this.closeConnection().catch(() => {});
@@ -113,7 +137,7 @@ export class ChatGPTBrowser {
     // An explicit import supersedes any configured source for this setup command.
     this.config.cookiesFile = undefined;
     const manual = await openManualChrome(this.config, { urls: [this.baseUrl] });
-    return { count, pid: manual.pid, waitForExit: async () => {
+    return { count, pid: manual.pid, autoCloseMs: this.config.manualCloseMs, close: () => manual.close(), waitForExit: async () => {
       await manual.waitForExit();
       this.manualHandoff = true;
     } };
@@ -123,7 +147,9 @@ export class ChatGPTBrowser {
     const cookies = normalizeCookies(input);
     // Saving before launch also allows a fresh import to repair an unreadable cookie store.
     await saveCookies(this.config.dataDir, cookies);
-    await this.start();
+    // Explicit imports replace cookies in the controlled context below; cookie
+    // setup supplies its own ordinary stage through prepareManualCookieSession.
+    await this.start(false);
     try {
       // Remove old parts of a split token when replacing it with a different-sized token.
       if (hasSessionCookies(cookies)) await this.context!.clearCookies({ name: /^(?:__Secure-)?(?:next-auth|authjs)\.session-token(?:\.\d+)?$/ });
@@ -154,7 +180,7 @@ export class ChatGPTBrowser {
     const challengeTitle = /^(?:just a moment(?:\.{3}|…)?|access denied|attention required!?)(?:\s*[-|].*)?$/i.test(title.trim());
     if (challengeTitle || /verify you are human|checking your browser|performing security verification|access denied/i.test(text)) {
       return { status: 'challenge', message: this.config.browserMode === 'cdp'
-        ? 'ChatGPT requires browser verification. Complete the checkbox in dedicated Chrome, then check session_status again.'
+        ? 'ChatGPT requires browser verification. Run npm run login for this account and complete the checkbox, then check session_status again.'
         : 'ChatGPT requires browser verification. Run npm run login and complete it in the visible browser.' };
     }
     const login = page.getByRole('button', { name: /^(log in|sign in)$/i }).or(page.getByRole('link', { name: /^(log in|sign in)$/i }));
@@ -167,8 +193,10 @@ export class ChatGPTBrowser {
     return { status: 'unavailable', message: 'ChatGPT opened, but its message box was not found. Image generation is unavailable until the page finishes loading or the browser adapter is updated.' };
   }
 
-  async sessionStatus(navigate = true): Promise<SessionStatus> {
+  async sessionStatus(navigate = true, settleMs = 0): Promise<SessionStatus> {
     const page = navigate ? await this.open() : await this.start();
+    // Cookie setup gives the reopened window its own verification interval.
+    if (settleMs > 0) await delay(settleMs);
     const deadline = Date.now() + 15_000;
     let state: SessionStatus;
     do {
@@ -257,8 +285,8 @@ export class ChatGPTBrowser {
       } else { stableKey = ''; stableSince = 0; }
       if (!unique.length && !streaming) this.throwForLimit(await this.visibleLimit(page, responseText));
       if (responseText !== lastText) { lastText = responseText; textSince = Date.now(); }
-      if (!unique.length && !streaming && responseText.trim() && Date.now() - textSince > 10_000 && !/generating|creating|processing|working on|starting|image generation/i.test(responseText)) {
-        throw new BrowserError('ChatGPT finished with a text response but no generated image. Check the conversation for a refusal, usage limit, or unavailable image tool.');
+      if (!unique.length && !streaming && responseText.trim() && Date.now() - textSince > 10_000 && !/generating|creating|processing|working on|starting|image generation\s+(?:is\s+)?(?:in progress|underway)/i.test(responseText)) {
+        throw new TextOnlyResponseError();
       }
       await delay(this.config.pollMs);
     }
@@ -268,8 +296,8 @@ export class ChatGPTBrowser {
   private throwForLimit(notice?: GenerationLimitNotice): void {
     if (notice?.kind === 'conversation_full') throw new ConversationFullError();
     if (notice?.kind === 'usage_limit') throw new BrowserError(notice.freeTier
-      ? 'Your ChatGPT Free plan image allowance has been exhausted. The batch has stopped; wait for the limit to reset before submitting more requests.'
-      : 'ChatGPT reported an image/account usage limit. The batch will stop; wait for the limit to reset before submitting more requests.',
+      ? 'Your ChatGPT Free plan image allowance has been exhausted. Wait for this account\'s limit to reset before using it again.'
+      : 'ChatGPT reported an image/account usage limit. Wait for this account\'s limit to reset before using it again.',
     notice.freeTier ? 'free_tier_exhausted' : 'image_usage_limit', notice.resetText);
   }
 
@@ -494,7 +522,23 @@ export class ChatGPTBrowser {
     return images;
   }
 
+  async closeAfterSetup(): Promise<void> {
+    await this.shutdown();
+  }
+
+  /** Save the session and fully close this profile; subsequent work can reopen it. */
+  async shutdown(): Promise<void> {
+    try { await this.close(); }
+    finally {
+      // close() already snapshots the session. Chrome also flushes its persistent profile.
+      if (this.config.browserMode === 'cdp') await stopChrome(this.config, { saveCookies: false });
+    }
+  }
+
   async close(): Promise<void> {
+    // Also stop an ordinary stage that is waiting for manual exit or whose close
+    // previously failed, before allowing this account's browser slot to switch.
+    await this.manualChrome?.close();
     await this.starting?.catch(() => {});
     try {
       if (this.context) {

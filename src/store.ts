@@ -14,6 +14,15 @@ export interface ImageCooldown {
   limitReset?: string;
 }
 export const imageCooldownMs = 24 * 60 * 60 * 1000;
+export interface JobAttempt {
+  batchAttempt: number;
+  status: JobStatus;
+  conversationUrl?: string;
+  images?: ImageArtifact[];
+  executionAccount?: string;
+  attemptedAccounts?: string[];
+  error?: string;
+}
 export interface Job {
   id: string;
   prompt: string;
@@ -32,6 +41,15 @@ export interface Job {
   limitReset?: string;
   limitDetectedAt?: string;
   retryAfter?: string;
+  /** The owning database stays fixed even when execution switches profiles. */
+  autoSwitchAccount?: boolean;
+  executionAccount?: string;
+  attemptedAccounts?: string[];
+  sameChatMandatory?: boolean;
+  batchAttempt?: number;
+  batchExecutionAccount?: string;
+  batchTriedAccounts?: string[];
+  previousAttempts?: JobAttempt[];
 }
 export interface Batch {
   id: string;
@@ -41,6 +59,8 @@ export interface Batch {
   total: number;
   progress: Record<JobStatus, number>;
   jobs: Job[];
+  sameChatMandatory: boolean;
+  attempt: number;
 }
 
 export class JobStore {
@@ -82,6 +102,23 @@ export class JobStore {
       || !Number.isFinite(Date.parse(cooldown.detectedAt)) || !Number.isFinite(Date.parse(cooldown.retryAfter))) throw new Error('The saved image cooldown is invalid.');
     return this.now() < Date.parse(cooldown.retryAfter) ? cooldown : undefined;
   }
+  /** Persist per executing profile, including requests owned by another account. */
+  recordTextOnlyFailure(): ImageCooldown | undefined {
+    return this.db.transaction(() => {
+      const row = this.db.prepare('SELECT body FROM settings WHERE key = ?').get('text_only_failures') as { body: string } | undefined;
+      const previous = row ? JSON.parse(row.body) as { count: number; lastFailureAt: number } : undefined;
+      const now = this.now();
+      // A streak must not immediately exhaust the account again after its cooldown expires.
+      const count = previous && now - previous.lastFailureAt < imageCooldownMs ? previous.count + 1 : 1;
+      this.db.prepare('INSERT INTO settings (key, body) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body')
+        .run('text_only_failures', JSON.stringify({ count, lastFailureAt: now }));
+      if (count < 2) return;
+      return this.recordImageLimit('image_usage_limit', 'Assumed ChatGPT image limit exhausted after two consecutive completed text-only responses without an image.');
+    })();
+  }
+  resetTextOnlyFailures(): void {
+    this.db.prepare('DELETE FROM settings WHERE key = ?').run('text_only_failures');
+  }
   create(prompt: string, referenceImages: ImageArtifact[] = [], aspectRatio?: string): Job {
     const now = new Date().toISOString();
     const job: Job = { id: randomUUID(), prompt, status: 'queued', createdAt: now, updatedAt: now,
@@ -90,13 +127,15 @@ export class JobStore {
     this.db.prepare('INSERT INTO jobs VALUES (?, ?, ?, ?)').run(job.id, now, job.status, JSON.stringify(job));
     return job;
   }
-  createBatch(prompts: string[], chatMode: ChatMode, referenceImages: ImageArtifact[] = [], aspectRatio?: string): Batch {
+  createBatch(prompts: string[], chatMode: ChatMode, referenceImages: ImageArtifact[] = [], aspectRatio?: string, autoSwitchAccount = false, sameChatMandatory = false): Batch {
     if (!prompts.length || prompts.length > 25) throw new Error('A batch requires 1–25 prompts.');
+    if (sameChatMandatory && chatMode !== 'same_chat') throw new Error('Mandatory same-chat batches cannot use separate chats.');
     const batchId = randomUUID();
     this.db.transaction(() => {
       for (const [batchIndex, prompt] of prompts.entries()) {
         const job = this.create(prompt, referenceImages, aspectRatio);
-        this.update(job.id, { batchId, batchIndex, chatMode });
+        this.update(job.id, { batchId, batchIndex, chatMode, ...(autoSwitchAccount ? { autoSwitchAccount } : {}),
+          ...(sameChatMandatory ? { sameChatMandatory, batchAttempt: 0 } : {}) });
       }
     })();
     return this.getBatch(batchId);
@@ -109,7 +148,38 @@ export class JobStore {
     for (const job of jobs) progress[job.status]++;
     const status: JobStatus = progress.running ? 'running' : progress.queued ? 'queued'
       : progress.failed ? 'failed' : progress.cancelled ? 'cancelled' : 'completed';
-    return { id, chatMode: jobs[0]!.chatMode!, ...(jobs[0]!.aspectRatio !== undefined ? { aspectRatio: jobs[0]!.aspectRatio } : {}), status, total: jobs.length, progress, jobs };
+    return { id, chatMode: jobs[0]!.chatMode!, ...(jobs[0]!.aspectRatio !== undefined ? { aspectRatio: jobs[0]!.aspectRatio } : {}), status, total: jobs.length, progress, jobs,
+      sameChatMandatory: jobs[0]!.sameChatMandatory ?? false, attempt: jobs[0]!.batchAttempt ?? 0 };
+  }
+  /** Keep original IDs and files; prior partial results are archived instead of mixed into the new batch. */
+  restartBatch(id: string, account: string, failedJobId: string, reason: string): void {
+    this.db.transaction(() => {
+      const batch = this.getBatch(id);
+      if (!batch.sameChatMandatory) throw new Error('Only a mandatory same-chat batch may be restarted.');
+      const tried = [...new Set([...batch.jobs.flatMap(job => job.batchTriedAccounts ?? []),
+        ...batch.jobs.flatMap(job => job.attemptedAccounts ?? []), account])];
+      for (const job of batch.jobs) {
+        const previousAttempts = [...(job.previousAttempts ?? [])];
+        if (job.status === 'completed' || job.status === 'running') {
+          previousAttempts.push({ batchAttempt: job.batchAttempt ?? 0, status: job.id === failedJobId ? 'failed' : job.status,
+            conversationUrl: job.conversationUrl, images: job.images, executionAccount: job.executionAccount,
+            attemptedAccounts: job.attemptedAccounts, ...(job.id === failedJobId ? { error: reason } : {}) });
+        }
+        this.update(job.id, { batchAttempt: batch.attempt + 1, batchExecutionAccount: account, batchTriedAccounts: tried,
+          ...(job.status !== 'cancelled' ? { status: 'queued', conversationUrl: undefined, images: undefined,
+            executionAccount: undefined, attemptedAccounts: undefined, error: undefined, errorCode: undefined,
+            limitReset: undefined, limitDetectedAt: undefined, retryAfter: undefined, previousAttempts } : {}) });
+      }
+    })();
+  }
+  /** Reserve space to replay a mandatory batch even after some of its jobs have completed. */
+  queueCapacityUsed(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS count FROM jobs AS job WHERE status = 'queued'
+      OR (status IN ('running', 'completed') AND json_extract(body, '$.sameChatMandatory') = 1
+        AND EXISTS (SELECT 1 FROM jobs AS pending WHERE pending.status IN ('queued', 'running')
+          AND json_extract(pending.body, '$.batchId') = json_extract(job.body, '$.batchId')))`)
+      .get() as { count: number };
+    return row.count;
   }
   stopBatch(id: string, reason: string): void {
     this.db.transaction(() => {

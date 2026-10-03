@@ -1,3 +1,4 @@
+import './support/headless.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
@@ -70,6 +71,19 @@ for (const scenario of ['accepted', 'background', 'ignored', 'usage_limit'] as c
   const browser = new ChatGPTBrowser(config, { baseUrl });
   const store = new JobStore(dir);
   const queue = new JobQueue(store, browser);
+  type Recorded = { removed: string | null; uploads: string | null; clicks: string | null; submissions: any[] };
+  let recorded: Recorded | undefined;
+  let generationPage: Awaited<ReturnType<ChatGPTBrowser['open']>> | undefined;
+  const inspect = async (page: Awaited<ReturnType<ChatGPTBrowser['open']>>): Promise<Recorded> => page.evaluate(() => ({
+    removed: sessionStorage.getItem('oldRemoved'), uploads: sessionStorage.getItem('uploads'),
+    clicks: sessionStorage.getItem('clicks'), submissions: JSON.parse(sessionStorage.getItem('submissions') || '[]'),
+  }));
+  const shutdown = browser.shutdown.bind(browser);
+  browser.shutdown = async () => {
+    generationPage = await browser.open();
+    recorded = await inspect(generationPage);
+    await shutdown();
+  };
   let observer;
   try {
     const paths = [path.join(dir, 'face.png'), path.join(dir, 'style.png')];
@@ -103,10 +117,16 @@ for (const scenario of ['accepted', 'background', 'ignored', 'usage_limit'] as c
         paths.map(file => ({ path: file, mimeType: 'image/png', bytes: png.length }))), /did not confirm accepting the message.*no automatic resend/);
       assert.equal(submitted, false, 'Do not record a submitted conversation when the click was ignored');
     }
-    observer ??= await connectChrome(config);
-    const page = observer.contexts()[0]!.pages()[0]!;
-    const recorded = await page.evaluate(() => ({ removed: sessionStorage.getItem('oldRemoved'), uploads: sessionStorage.getItem('uploads'),
-      clicks: sessionStorage.getItem('clicks'), submissions: JSON.parse(sessionStorage.getItem('submissions') || '[]') }));
+    if (scenario === 'ignored') {
+      observer ??= await connectChrome(config);
+      recorded = await inspect(observer.contexts()[0]!.pages()[0]!);
+    } else {
+      const closeDeadline = Date.now() + 5000;
+      while (queue.isBusy() && Date.now() < closeDeadline) await delay(20);
+      assert.equal(queue.isBusy(), false);
+      assert.equal(generationPage?.isClosed(), true, 'The submission browser closes once all queued work finishes');
+    }
+    assert.ok(recorded);
     assert.equal(recorded.removed, 'yes');
     assert.equal(recorded.uploads, '2');
     assert.equal(recorded.clicks, scenario === 'accepted' || scenario === 'background' ? '2' : '1');

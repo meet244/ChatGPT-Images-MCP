@@ -1,3 +1,4 @@
+import './support/headless.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer as createHttpServer } from 'node:http';
@@ -80,7 +81,7 @@ test('restart preserves batch context and stops the rest of an interrupted batch
   } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
-for (const scenario of ['same_chat', 'separate_chats', 'rollover', 'preflight_rollover', 'usage_limit'] as const) test(`MCP batch: ${scenario}, shared references, and individual image results`, { timeout: 35_000 }, async () => {
+for (const scenario of ['same_chat', 'rollover', 'preflight_rollover', 'usage_limit'] as const) test(`MCP batch: ${scenario}, shared references, and individual image results`, { timeout: 35_000 }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-batch-browser-'));
   const reference = await sharp({ create: { width: 300, height: 200, channels: 3, background: '#ff8800' } }).png().toBuffer();
   const colors = ['#ff0000', '#00ff00', '#0000ff'];
@@ -136,6 +137,14 @@ for (const scenario of ['same_chat', 'separate_chats', 'rollover', 'preflight_ro
   const baseUrl = `http://127.0.0.1:${(fixture.address() as { port: number }).port}/`;
   const config = loadConfig({ CHATGPT_DATA_DIR: dir, CHATGPT_POLL_MS: '100', CHATGPT_TIMEOUT_MS: '10000' });
   const browser = new ChatGPTBrowser(config, { baseUrl });
+  let recorded: { uploads: any[]; submissions: any[] } | undefined;
+  let generationPage: Awaited<ReturnType<ChatGPTBrowser['open']>> | undefined;
+  const shutdown = browser.shutdown.bind(browser);
+  browser.shutdown = async () => {
+    generationPage = await browser.open();
+    recorded = await generationPage.evaluate(() => ({ uploads: JSON.parse(sessionStorage.getItem('uploads') || '[]'), submissions: JSON.parse(sessionStorage.getItem('submissions') || '[]') }));
+    await shutdown();
+  };
   const store = new JobStore(dir);
   const queue = new JobQueue(store, browser);
   const server = createServer(store, queue, browser);
@@ -146,8 +155,7 @@ for (const scenario of ['same_chat', 'separate_chats', 'rollover', 'preflight_ro
     const referencePath = path.join(dir, 'reference.png'); await writeFile(referencePath, reference);
     const aspectRatio = scenario === 'same_chat' ? undefined : '16:9';
     const initial = parsed(await client.callTool({ name: 'generate_images', arguments: { prompts: ['one', 'two', 'three'], reference_images: [referencePath],
-      ...(aspectRatio !== undefined ? { aspect_ratio: aspectRatio } : {}),
-      ...(scenario === 'separate_chats' ? { different_chat: true } : scenario === 'same_chat' ? { different_chat: false } : {}) } }));
+      ...(aspectRatio !== undefined ? { aspect_ratio: aspectRatio } : {}) } }));
     assert.equal(initial.total, 3);
     assert.equal(new Set(initial.jobs.map((job: any) => job.referenceImages[0].path)).size, 1, 'References are copied once for the whole batch');
     await rm(referencePath);
@@ -165,8 +173,11 @@ for (const scenario of ['same_chat', 'separate_chats', 'rollover', 'preflight_ro
       const image = parsed(await client.callTool({ name: 'get_image', arguments: { job_id: job.id, include_preview: false } }));
       assert.equal(image.path, job.images[0].path);
     }
-    const page = await browser.open();
-    const recorded = await page.evaluate(() => ({ uploads: JSON.parse(sessionStorage.getItem('uploads') || '[]'), submissions: JSON.parse(sessionStorage.getItem('submissions') || '[]') }));
+    const closeDeadline = Date.now() + 5000;
+    while (queue.isBusy() && Date.now() < closeDeadline) await delay(20);
+    assert.equal(queue.isBusy(), false, 'Batch browser cleanup finishes');
+    assert.ok(recorded);
+    assert.equal(generationPage?.isClosed(), true, 'The batch browser closes after its final image');
     for (const submission of recorded.submissions) {
       if (aspectRatio !== undefined) assert.ok(submission.text.trimEnd().endsWith(`Output aspect ratio = ${aspectRatio}`));
       else assert.doesNotMatch(submission.text, /aspect ratio/i);
@@ -178,10 +189,6 @@ for (const scenario of ['same_chat', 'separate_chats', 'rollover', 'preflight_ro
       assert.equal(recorded.uploads.length, 1);
       assert.deepEqual(recorded.submissions.map((item: any) => item.prompt), ['one', 'two', 'three']);
       assert.match(recorded.submissions[1].text, /original reference images previously attached/);
-    } else if (scenario === 'separate_chats') {
-      assert.equal(new Set(batch.jobs.map((job: any) => job.conversationUrl)).size, 3);
-      assert.equal(recorded.uploads.length, 3);
-      assert.deepEqual(recorded.submissions.map((item: any) => item.prompt), ['one', 'two', 'three']);
     } else if (scenario === 'rollover' || scenario === 'preflight_rollover') {
       assert.equal(recorded.uploads.length, 2);
       assert.notEqual(batch.jobs[0].conversationUrl, batch.jobs[1].conversationUrl);

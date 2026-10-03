@@ -1,3 +1,4 @@
+import '../test/support/headless.mjs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { Client } from '@modelcontextprotocol/client';
@@ -5,6 +6,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import sharp from 'sharp';
 import lockfile from 'proper-lockfile';
 import { loadConfig, projectRoot } from '../dist/config.js';
+import { AccountRegistry } from '../dist/accounts.js';
+import { acquireRuntime } from '../dist/runtime.js';
+import { stopChrome } from '../dist/chrome.js';
 
 class LiveTestError extends Error {}
 
@@ -39,8 +43,17 @@ try {
     if (error.code === 'ENOENT') return false;
     throw new LiveTestError('Could not check the running server. Check the project data directory before testing.');
   });
-  if (active) throw new LiveTestError('A server is already running. Press Ctrl+C in its terminal, leave Chrome open, then run npm run test:live again.');
-  console.error('Connecting to the MCP server. Stop any existing npm start process first; leave Chrome open.');
+  if (active) throw new LiveTestError('A server is already running. Disconnect MCP clients or stop npm start, then run npm run test:live again.');
+  // An already-open visible profile would bypass the test-only headless launcher.
+  // Close only our dedicated profiles before the test worker reopens them headlessly.
+  const registry = new AccountRegistry(config);
+  for (const account of await registry.names()) {
+    const accountConfig = await registry.require(account);
+    const release = await acquireRuntime(accountConfig);
+    try { await stopChrome(accountConfig); }
+    finally { await release(); }
+  }
+  console.error('Connecting to the MCP server for a headless live test.');
   await client.connect(transport);
   const session = await call('session_status');
   if (session.status !== 'ready') throw new LiveTestError(`Session is ${session.status}: ${session.message}`);

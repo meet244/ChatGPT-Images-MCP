@@ -1,7 +1,8 @@
 import path from 'node:path';
 import os from 'node:os';
 import { access, mkdir, readFile, rm } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, type Browser, type BrowserContext } from 'playwright';
 import type { Config } from './config.js';
@@ -59,8 +60,9 @@ export async function ensureChrome(config: Config): Promise<string> {
     '--remote-debugging-address=127.0.0.1',
     '--no-first-run',
     '--no-default-browser-check',
+    // Restore session cookies without opening restored windows or an extra blank tab.
     '--restore-last-session',
-    'about:blank',
+    '--no-startup-window',
   ], { detached: true, stdio: 'ignore' });
   let failed = false;
   let exited = false;
@@ -84,7 +86,29 @@ export async function connectChrome(config: Config): Promise<Browser> {
   catch { throw new ChromeError('Could not connect to dedicated Chrome. Run browser-close, then browser to reopen it.'); }
 }
 
-export interface ManualChromeHandle { pid: number; waitForExit(): Promise<void>; }
+export interface ManualChromeHandle { pid: number; waitForExit(): Promise<void>; close(): Promise<void>; }
+
+/** Use the same ordinary-to-controlled handoff for setup and later browser starts. */
+export async function finishManualChrome(
+  manual: { waitForExit(): Promise<void>; close?(): Promise<void> },
+  autoCloseMs: number,
+  onClosing?: () => void,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const exited = manual.waitForExit();
+    if (autoCloseMs > 0 && manual.close) {
+      await Promise.race([exited, new Promise<void>((resolve, reject) => {
+        timer = setTimeout(() => {
+          onClosing?.();
+          manual.close!().then(resolve, reject);
+        }, autoCloseMs);
+      })]);
+    }
+    // Do not attach controlled Chrome until the ordinary process has fully exited.
+    await exited;
+  } finally { clearTimeout(timer); }
+}
 
 /** Ordinary browser; deliberately exposes no automation endpoint. */
 export async function openManualChrome(config: Config, options: { urls?: string[] } = {}): Promise<ManualChromeHandle> {
@@ -108,7 +132,24 @@ export async function openManualChrome(config: Config, options: { urls?: string[
     child.once('error', () => reject(new ChromeError('Could not launch ordinary Chrome for manual troubleshooting.')));
   });
   child.unref();
-  return { pid: child.pid!, async waitForExit() {
+  return { pid: child.pid!, async close() {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    // Ask this profile's running Chrome to exit through its normal browser shutdown,
+    // so pending cookie writes are flushed before the controlled handoff.
+    if (process.platform === 'darwin') {
+      try {
+        const { stdout } = await promisify(execFile)('/usr/bin/osascript', ['-l', 'JavaScript', '-e',
+          `ObjC.import('AppKit'); $.NSRunningApplication.runningApplicationWithProcessIdentifier(${child.pid}).terminate;`], { timeout: 5000 });
+        if (stdout.trim() !== 'true') throw new Error('Termination was not accepted');
+      } catch { throw new ChromeError('Could not close verification Chrome. Fully quit this dedicated Chrome instance manually.'); }
+    } else if (!child.kill('SIGTERM')) throw new ChromeError('Could not close verification Chrome. Fully quit this dedicated Chrome instance manually.');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([exited, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ChromeError('Verification Chrome did not exit. Fully quit this dedicated Chrome instance, then retry setup. Cookies are retained.')), 15_000);
+      })]);
+    } finally { clearTimeout(timer); }
+  }, async waitForExit() {
     // Keep terminal setup alive until ordinary Chrome fully exits.
     child.ref();
     try {
@@ -149,13 +190,15 @@ export async function seedManualChromeCookies(config: Config, input: BrowserCook
 }
 
 /** Explicitly closes only the dedicated Chrome identified by this app's private profile. */
-export async function stopChrome(config: Config): Promise<boolean> {
+export async function stopChrome(config: Config, options: { saveCookies?: boolean } = {}): Promise<boolean> {
   const endpoint = await runningChrome(config);
   if (!endpoint) return false;
   const browser = await chromium.connectOverCDP(endpoint, { noDefaults: true, timeout: 10_000 });
   try {
-    const context = browser.contexts()[0];
-    if (context) await saveCookies(config.dataDir, await context.cookies());
+    if (options.saveCookies !== false) {
+      const context = browser.contexts()[0];
+      if (context) await saveCookies(config.dataDir, await context.cookies());
+    }
     const session = await browser.newBrowserCDPSession();
     await session.send('Browser.close');
   } finally { await browser.close().catch(() => {}); }

@@ -1,13 +1,15 @@
 import { BrowserError, type ChatGPTBrowser, type SessionStatus } from './browser.js';
 import { parseCookieInput, type BrowserCookie } from './cookies.js';
 import { question, readCookieInput } from './terminal.js';
+import { finishManualChrome } from './chrome.js';
 
 export interface SetupBrowser {
   hasSavedSession(): Promise<boolean>;
-  sessionStatus(navigate?: boolean): Promise<SessionStatus>;
+  sessionStatus: ChatGPTBrowser['sessionStatus'];
   importCookieValues: ChatGPTBrowser['importCookieValues'];
   setHeadless(headless: boolean): Promise<void>;
   open: ChatGPTBrowser['open'];
+  closeAfterSetup: ChatGPTBrowser['closeAfterSetup'];
   prepareManualCookieSession?: ChatGPTBrowser['prepareManualCookieSession'];
 }
 export interface SetupTerminal {
@@ -23,14 +25,25 @@ export async function importCookiesWithVerification(browser: SetupBrowser, cooki
   if (manual) {
     count = manual.count;
     io.print(`Saved ${count} cookies. Ordinary Chrome is open for this account.`);
-    io.print('Let ChatGPT load and complete any verification. When ChatGPT works, fully quit this account’s dedicated Chrome instance. Controlled Chrome will reconnect automatically after it exits. On macOS, closing a window may leave Chrome running.');
-    await manual.waitForExit();
+    const autoCloseMs = manual.autoCloseMs ?? 0;
+    if (autoCloseMs > 0 && manual.close) {
+      io.print(`Complete any verification now. This dedicated Chrome will close automatically in ${autoCloseMs / 1000} seconds, then the session will be checked. You can fully quit it sooner. Set CHATGPT_MANUAL_CLOSE_MS=0 to wait for manual closing instead.`);
+    } else {
+      io.print('Let ChatGPT load and complete any verification. When ChatGPT works, fully quit this account’s dedicated Chrome instance. Controlled Chrome will reconnect automatically after it exits. On macOS, closing a window may leave Chrome running.');
+    }
+    await finishManualChrome(manual, autoCloseMs, () => io.print('Closing verification Chrome…'));
     io.print('Manual Chrome closed. Reconnecting controlled Chrome using the same account profile…');
   } else {
     count = await browser.importCookieValues(cookies);
     io.print(`Saved ${count} cookies locally. Checking the session…`);
   }
-  return { count, state: await browser.sessionStatus() };
+  const settleMs = manual ? (manual.autoCloseMs || 10_000) : 0;
+  if (settleMs > 0) io.print(`Controlled Chrome will stay open for at least ${settleMs / 1000} seconds before checking and closing. Complete any verification in this window too.`);
+  try { return { count, state: await browser.sessionStatus(true, settleMs) }; }
+  finally {
+    await browser.closeAfterSetup();
+    io.print('Session browser closed. The saved login is retained; the MCP will reopen the browser when needed.');
+  }
 }
 
 export async function checkSavedSession(browser: SetupBrowser): Promise<SessionStatus> {

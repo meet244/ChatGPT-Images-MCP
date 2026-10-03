@@ -1,3 +1,4 @@
+import './support/headless.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtemp, rm, readdir } from 'node:fs/promises';
@@ -8,7 +9,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { JobStore, imageCooldownMs } from '../src/store.js';
 import { JobQueue, CooldownError } from '../src/queue.js';
-import { BrowserError, ChatGPTBrowser } from '../src/browser.js';
+import { BrowserError, TextOnlyResponseError, ChatGPTBrowser } from '../src/browser.js';
 import { createServer } from '../src/server.js';
 import { loadConfig } from '../src/config.js';
 
@@ -126,5 +127,38 @@ test('browser errors without an image-usage code do not trigger cooldown', async
     resumed.kick(); await resumed.stop();
     assert.equal(store.get(pending.id).status, 'completed');
     assert.deepEqual(calls, ['timeout', 'another request']);
+  } finally { await queue.stop(); store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('text-only streak survives restart, records cooldown on the second failure, and expires after 24 hours', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'images-text-only-'));
+  let now = Date.parse('2026-10-03T06:00:00.000Z');
+  let store = new JobStore(dir, () => now);
+  let calls = 0;
+  const browser = { async generate(): Promise<never> { calls++; throw new TextOnlyResponseError(); } };
+  let queue = new JobQueue(store, browser);
+  try {
+    const first = queue.enqueue('first'); await queue.stop();
+    assert.equal(store.get(first.id).status, 'failed');
+    assert.equal(store.get(first.id).errorCode, undefined);
+    assert.equal(store.imageCooldown(), undefined);
+    store.close(); store = new JobStore(dir, () => now); queue = new JobQueue(store, browser);
+    const second = queue.enqueue('second'); await queue.stop();
+    const cooldown = store.imageCooldown()!;
+    assert.equal(calls, 2);
+    assert.equal(store.get(second.id).errorCode, 'image_usage_limit');
+    assert.equal(store.get(second.id).retryAfter, cooldown.retryAfter);
+    assert.equal(cooldown.detectedAt, '2026-10-03T06:00:00.000Z');
+    store.close(); store = new JobStore(dir, () => now); queue = new JobQueue(store, browser);
+    assert.deepEqual(store.imageCooldown(), cooldown);
+    assert.throws(() => queue.enqueue('blocked'), CooldownError);
+    now += 60 * 60 * 1000;
+    assert.throws(() => queue.enqueue('one hour is still too early'), CooldownError);
+    assert.deepEqual(store.imageCooldown(), cooldown);
+    now += imageCooldownMs - 60 * 60 * 1000;
+    const next = queue.enqueue('after cooldown'); await queue.stop();
+    assert.equal(store.get(next.id).errorCode, undefined, 'Expired streak begins at one again');
+    assert.equal(store.imageCooldown(), undefined);
+    assert.equal(calls, 3);
   } finally { await queue.stop(); store.close(); await rm(dir, { recursive: true, force: true }); }
 });
