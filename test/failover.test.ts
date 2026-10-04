@@ -192,9 +192,13 @@ test('automatic failover skips unusable profiles, keeps the job ID and image ret
     assert.ok(parsed(preview).path.startsWith(path.join(f.dir, 'accounts/e-ready/images')));
     const cooldown = f.store.imageCooldown();
     await f.registry.use('default');
+    await until(() => !f.manager.isBusy());
     const ready = parsed(await f.call('session_status'));
     assert.equal(ready.status, 'ready'); assert.equal(ready.account, undefined);
     assert.equal(f.calls.length, 2, 'Session routing must not submit another prompt');
+    // Offline status cannot see this fixture's remote challenge; generation assertions keep their original destination.
+    assert.equal(await f.registry.active(), 'b-challenge');
+    await f.registry.use('e-ready');
     const next = parsed(await f.call('generate_image', { prompt: 'skip the saved cooldown' }));
     assert.equal(await f.registry.owner(next.id), 'e-ready');
     await until(async () => parsed(await f.call('get_job_status', { job_id: next.id })).status === 'completed');
@@ -210,8 +214,8 @@ test('automatic failover skips unusable profiles, keeps the job ID and image ret
 test('session status switches an assumed-exhausted account to a ready account without submitting images', async () => {
   const f = await fixture();
   try {
-    await f.add('a-challenge'); await f.add('b-ready');
-    f.statuses.set('a-challenge', { status: 'challenge', message: 'Verification required' });
+    const expired = await f.add('a-expired'); await f.add('b-ready');
+    await saveCookies(expired.dataDir, [{ name: '__Secure-next-auth.session-token', value: 'expired-fixture', domain: '.chatgpt.com', path: '/', expires: Date.now() / 1000 - 60 }]);
     f.store.recordTextOnlyFailure(); f.store.recordTextOnlyFailure();
     const cooldown = f.store.imageCooldown();
     const result = parsed(await f.call('session_status'));
@@ -219,55 +223,55 @@ test('session status switches an assumed-exhausted account to a ready account wi
     assert.equal(result.account, undefined);
     assert.equal(await f.registry.active(), 'b-ready');
     assert.equal(result.errorCode, undefined);
-    assert.deepEqual(f.closed, ['a-challenge', 'b-ready']);
+    assert.deepEqual(f.closed, [], 'Status never opens or closes a profile');
     assert.equal(f.calls.length, 0);
     assert.deepEqual(f.store.imageCooldown(), cooldown);
   } finally { await f.close(); }
 });
 
-test('session status reselects if the chosen fallback becomes exhausted before its session is inspected', async () => {
+test('session status skips recorded cooldowns without opening another account runtime', async () => {
   const f = await fixture();
   try {
     await f.add('second'); await f.add('third');
     f.store.recordImageLimit('image_usage_limit', 'Default quota.');
-    const inspect = f.manager.inspectSession.bind(f.manager);
-    f.manager.inspectSession = async runtime => {
-      if (runtime.account === 'second') runtime.store.recordImageLimit('image_usage_limit', 'Quota detected by concurrent work.');
-      return inspect(runtime);
-    };
+    const second = new JobStore((await f.registry.require('second')).dataDir);
+    second.recordImageLimit('image_usage_limit', 'Previously detected quota.'); second.close();
     const result = parsed(await f.call('session_status'));
     assert.equal(result.status, 'ready');
     assert.equal(result.account, undefined);
     assert.equal(await f.registry.active(), 'third');
     assert.equal(f.calls.length, 0);
-    assert.deepEqual(f.closed, ['second', 'third']);
+    assert.deepEqual(f.closed, []);
   } finally { await f.close(); }
 });
 
 for (const status of ['challenge', 'login_required', 'unavailable', 'browser_error'] as const) {
-  test(`session status selects an existing fallback and reports ${status} instead of the exhausted account's limit`, async () => {
+  test(`session status uses cached readiness without probing the remote ${status} state`, async () => {
     const f = await fixture();
     try {
       await f.add('second');
       f.store.recordTextOnlyFailure(); f.store.recordTextOnlyFailure();
       const runtime = await f.manager.resolve('second');
+      let probes = 0;
       runtime.browser.sessionStatus = async () => {
+        probes++;
         if (status === 'browser_error') throw new BrowserError('Could not initialize dedicated Chrome.');
         return { status, message: 'Replacement session requires attention.' };
       };
       const result = parsed(await f.call('session_status'));
       assert.equal(result.account, undefined);
-      assert.equal(result.status, status === 'browser_error' ? 'unavailable' : status);
+      assert.equal(result.status, 'ready');
+      assert.equal(probes, 0);
       assert.equal(await f.registry.active(), 'second');
       for (const key of ['errorCode', 'error', 'detectedAt', 'retryAfter']) assert.equal(result[key], undefined);
-      assert.doesNotMatch(result.message, /No other|Assumed|exhausted/);
+      assert.equal(result.message, undefined);
       assert.equal(f.calls.length, 0);
-      assert.deepEqual(f.closed, ['second'], 'Close the selected browser even when readiness fails');
+      assert.deepEqual(f.closed, [], 'Cached status does not touch the browser');
     } finally { await f.close(); }
   });
 }
 
-test('session status reports a locked replacement as busy instead of pretending no other account exists', async () => {
+test('session status reads a locked replacement without acquiring its browser lock', async () => {
   const f = await fixture();
   let release: (() => Promise<void>) | undefined;
   try {
@@ -276,8 +280,10 @@ test('session status reports a locked replacement as busy instead of pretending 
     f.store.recordImageLimit('image_usage_limit', 'Confirmed quota.');
     const result = parsed(await f.call('session_status'));
     assert.equal(result.account, undefined);
-    assert.equal(result.status, 'busy');
-    assert.deepEqual(result, { status: 'busy' });
+    assert.equal(result.status, 'ready');
+    assert.deepEqual(result, { status: 'ready' });
+    assert.equal(await f.registry.active(), 'second');
+    assert.deepEqual(f.closed, []);
     assert.equal(result.errorCode, undefined);
     assert.equal(f.calls.length, 0);
   } finally { await release?.(); await f.close(); }

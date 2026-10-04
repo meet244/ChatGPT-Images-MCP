@@ -5,10 +5,11 @@ import Database from 'better-sqlite3';
 import lockfile from 'proper-lockfile';
 import type { Config } from './config.js';
 import { ChatGPTBrowser, BrowserError, TextOnlyResponseError, type GenerationOptions } from './browser.js';
-import { JobStore, type Job } from './store.js';
+import { JobStore, imageCooldownMs, type ImageCooldown, type Job } from './store.js';
 import { JobQueue, CooldownError, BatchRestartError } from './queue.js';
 import { acquireRuntime } from './runtime.js';
 import { stopChrome } from './chrome.js';
+import { inspectSavedSession, type SavedSessionStatus } from './saved-session.js';
 
 export const accountNamePattern = /^[a-z][a-z0-9_-]{0,47}$/;
 export function validateAccountName(name: string): string {
@@ -87,6 +88,10 @@ export class AccountRegistry {
   }
   async usePriorityOrder(): Promise<void> {
     await this.updateSettings(settings => { settings.mode = 'priority'; delete settings.selected; });
+  }
+  async manualSelection(): Promise<string | undefined> {
+    const settings = await this.settings();
+    return settings.mode === 'manual' ? settings.selected : undefined;
   }
   async orderedNames(): Promise<string[]> {
     const [names, active, settings] = await Promise.all([this.names(), this.active(), this.settings()]);
@@ -325,6 +330,67 @@ export class AccountManager {
       await runtime.browser.shutdown();
       if (this.activeBrowser === runtime) this.activeBrowser = undefined;
     }));
+  }
+  /** MCP status reads saved sessions/history without opening runtimes or browsers. */
+  async inspectSavedSession(): Promise<SavedSessionStatus> {
+    const names = await this.registry.orderedNames();
+    if (!names.length) throw new NoAccountsError();
+    if ([...this.runtimes.values()].some(({ queue }) => queue.hasPendingWork())) return { status: 'busy' };
+    const manual = await this.registry.manualSelection();
+    let replaceManual = false;
+    let limited: SavedSessionStatus | undefined;
+    let attention: { account: string; state: SavedSessionStatus } | undefined;
+    let missing: SavedSessionStatus | undefined;
+    for (const account of names) {
+      let state: SavedSessionStatus;
+      try {
+        const runtime = this.runtimes.get(account);
+        const cooldown = runtime ? runtime.store.imageCooldown() : await this.registry.inspectDatabase(account, db => {
+          const row = db.prepare("SELECT body FROM settings WHERE key = 'image_cooldown'").get() as { body: string } | undefined;
+          let value: ImageCooldown | undefined;
+          if (row) value = JSON.parse(row.body);
+          else {
+            const previous = db.prepare("SELECT body FROM jobs WHERE status = 'failed' AND json_extract(body, '$.errorCode') IN ('free_tier_exhausted', 'image_usage_limit') ORDER BY COALESCE(json_extract(body, '$.limitDetectedAt'), json_extract(body, '$.updatedAt')) DESC LIMIT 1").get() as { body: string } | undefined;
+            if (previous) {
+              const job = JSON.parse(previous.body) as Job;
+              const detectedAt = job.limitDetectedAt ?? job.updatedAt;
+              value = { errorCode: job.errorCode!, error: job.error ?? '', detectedAt,
+                retryAfter: new Date(Date.parse(detectedAt) + imageCooldownMs).toISOString() };
+            }
+          }
+          if (!value) return;
+          if (!['free_tier_exhausted', 'image_usage_limit'].includes(value.errorCode)
+            || !Number.isFinite(Date.parse(value.detectedAt)) || !Number.isFinite(Date.parse(value.retryAfter))) throw new Error();
+          return Date.now() < Date.parse(value.retryAfter) ? value : undefined;
+        });
+        const saved = await inspectSavedSession(await this.registry.require(account));
+        state = saved.reason === 'expired' ? saved
+          : cooldown ? { status: 'usage_limit', retryAfter: cooldown.retryAfter } : saved;
+      } catch {
+        state = { status: 'unavailable', message: 'Saved session history could not be read. Run setup for this account.' };
+      }
+      if (account === manual && state.reason) replaceManual = true;
+      if (state.status === 'ready') {
+        if (this.isBusy()) return { status: 'busy' };
+        if (replaceManual) await this.registry.select(account);
+        else if (await this.registry.active() !== account) await this.registry.use(account);
+        return this.isBusy() ? { status: 'busy' } : state;
+      }
+      if (state.status === 'usage_limit') limited ??= state;
+      else if (state.reason === 'missing') {
+        if (!this.autoSwitchAccounts && account === manual) { attention = { account, state }; break; }
+        missing ??= state;
+        continue;
+      }
+      else attention ??= { account, state };
+      if (!this.autoSwitchAccounts) break;
+    }
+    if (attention) {
+      if (this.isBusy()) return { status: 'busy' };
+      if (await this.registry.active() !== attention.account) await this.registry.use(attention.account);
+      return attention.state;
+    }
+    return limited ?? missing!;
   }
   private configureQueue(runtime: AccountRuntime): void {
     runtime.queue.setExecutor((job, submitted, options, previous) => this.generate(runtime, job, submitted, options, previous));

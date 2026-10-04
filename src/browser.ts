@@ -1,13 +1,14 @@
 import path from 'node:path';
-import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, webkit, type Browser, type BrowserContext, type Page, type Locator } from 'playwright';
 import sharp from 'sharp';
 import type { Config } from './config.js';
 import { readCookies, normalizeCookies, hasSessionCookies, type BrowserCookie } from './cookies.js';
 import { readSavedCookies, saveCookies } from './session-store.js';
+import { inspectSavedSession } from './saved-session.js';
 import type { ImageArtifact } from './store.js';
-import { connectChrome, ChromeError, chromeProfile, runningChrome, finishManualChrome, seedManualChromeCookies, openManualChrome, stopChrome, type ManualChromeHandle } from './chrome.js';
+import { connectChrome, ChromeError, seedManualChromeCookies, openManualChrome, stopChrome } from './chrome.js';
 import { generationLimitNotice, type GenerationLimitNotice } from './limits.js';
 
 export type SessionStatus = { status: 'ready' | 'login_required' | 'challenge' | 'unavailable'; message: string };
@@ -38,40 +39,24 @@ export class ChatGPTBrowser {
   private page?: Page;
   private starting?: Promise<Page>;
   private manualHandoff = false;
-  private manualChrome?: ManualChromeHandle;
   private readonly baseUrl: string;
   constructor(private config: Config, options: { baseUrl?: string } = {}) {
     this.baseUrl = options.baseUrl ?? 'https://chatgpt.com/';
   }
 
-  private async start(manualWarmup = true): Promise<Page> {
+  private async start(): Promise<Page> {
     if (this.page && !this.page.isClosed()) return this.page;
     if (this.starting) return this.starting;
-    this.starting = this.launch(manualWarmup);
+    this.starting = this.launch();
     try { return await this.starting; } finally { this.starting = undefined; }
   }
 
-  private async launch(manualWarmup: boolean): Promise<Page> {
+  private async launch(): Promise<Page> {
     await this.closeConnection();
     const profile = path.join(this.config.dataDir, this.config.browserMode === 'webkit' ? 'webkit-profile' : 'browser-profile');
     await mkdir(profile, { recursive: true, mode: 0o700 });
     try {
       if (this.config.browserMode === 'cdp') {
-        if (manualWarmup && !this.manualHandoff && !await runningChrome(this.config) && await this.hasSavedSession()) {
-          // A fresh generation/session browser follows the ordinary Chrome stage
-          // used during cookie setup, with the same persistent account profile.
-          let hasProfile = false;
-          try { hasProfile = (await stat(chromeProfile(this.config))).isDirectory(); }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-          if (!hasProfile || this.config.cookiesFile) {
-            const cookies = this.config.cookiesFile ? await readCookies(this.config.cookiesFile) : await readSavedCookies(this.config.dataDir);
-            await seedManualChromeCookies(this.config, cookies);
-          }
-          this.manualChrome = await openManualChrome(this.config, { urls: [this.baseUrl] });
-          await finishManualChrome(this.manualChrome, this.config.manualCloseMs);
-          this.manualChrome = undefined;
-          this.manualHandoff = true;
-        }
         this.connection = await connectChrome(this.config);
         this.context = this.connection.contexts()[0];
         if (!this.context) throw new Error('Dedicated Chrome has no default browser context.');
@@ -129,6 +114,8 @@ export class ChatGPTBrowser {
     return hasSessionCookies(cookies);
   }
 
+  savedSessionStatus() { return inspectSavedSession(this.config); }
+
   async prepareManualCookieSession(input: BrowserCookie[]): Promise<ManualCookieSetup | undefined> {
     if (this.config.browserMode !== 'cdp') return undefined;
     const cookies = normalizeCookies(input);
@@ -149,7 +136,7 @@ export class ChatGPTBrowser {
     await saveCookies(this.config.dataDir, cookies);
     // Explicit imports replace cookies in the controlled context below; cookie
     // setup supplies its own ordinary stage through prepareManualCookieSession.
-    await this.start(false);
+    await this.start();
     try {
       // Remove old parts of a split token when replacing it with a different-sized token.
       if (hasSessionCookies(cookies)) await this.context!.clearCookies({ name: /^(?:__Secure-)?(?:next-auth|authjs)\.session-token(?:\.\d+)?$/ });
@@ -260,7 +247,8 @@ export class ChatGPTBrowser {
     const aspectRatio = options.aspectRatio !== undefined ? `\n\nOutput aspect ratio = ${options.aspectRatio}` : '';
     await composer.fill(`${instruction} Generate the image itself using ChatGPT's image creation feature.\n\n${prompt}${aspectRatio}`);
     if (referenceImages.length && !options.reuseReferences) await this.attachReferences(page, referenceImages);
-    await this.submitPrompt(page, composer, initialCount, initialGalleryCount, initialResultSources);
+    await this.submitPrompt(page, composer, initialCount, initialGalleryCount, initialResultSources,
+      options.reuseReferences ? [] : referenceImages.map(image => path.basename(image.path)));
     onSubmitted(page.url());
     let conversationUrl = page.url();
     const deadline = Date.now() + this.config.timeoutMs;
@@ -301,14 +289,17 @@ export class ChatGPTBrowser {
     notice.freeTier ? 'free_tier_exhausted' : 'image_usage_limit', notice.resetText);
   }
 
-  private async submitPrompt(page: Page, composer: Locator, initialAssistantCount: number, initialGalleryCount: number, initialResultSources: ReadonlySet<string>): Promise<void> {
+  private async submitPrompt(page: Page, composer: Locator, initialAssistantCount: number, initialGalleryCount: number, initialResultSources: ReadonlySet<string>, referenceNames: string[] = []): Promise<void> {
     const send = page.locator(this.config.selectors.send).filter({ visible: true }).first();
-    const readyDeadline = Date.now() + Math.min(60_000, this.config.timeoutMs);
+    // Activate before checking readiness: foregrounding can update upload UI state.
+    try { await page.bringToFront(); }
+    catch { throw new BrowserError('Could not activate the ChatGPT tab to send the prompt. No prompt was submitted. Keep the dedicated Chrome window open.'); }
+    const readyDeadline = Date.now() + (referenceNames.length ? this.config.timeoutMs : Math.min(60_000, this.config.timeoutMs));
     let readySince = 0;
     while (Date.now() < readyDeadline) {
       this.throwForLimit(await this.visibleLimit(page));
       const ready = await send.isVisible() && await send.isEnabled()
-        && !await page.locator(this.config.selectors.uploadProgress).filter({ visible: true }).count();
+        && await this.referencesReady(page, referenceNames);
       if (ready) {
         if (!readySince) readySince = Date.now();
         if (Date.now() - readySince >= 500) break;
@@ -317,10 +308,6 @@ export class ChatGPTBrowser {
     }
     if (!readySince || Date.now() - readySince < 500) throw new BrowserError('ChatGPT did not make the send button ready. No prompt was submitted. Inspect the attachments and browser session.');
     const initialUserCount = await page.locator(userMessages).count();
-    // Chrome can suspend animation frames in a background tab. Playwright's click
-    // waits for those frames even when Send is enabled and unobstructed.
-    try { await page.bringToFront(); }
-    catch { throw new BrowserError('Could not activate the ChatGPT tab to send the prompt. No prompt was submitted. Keep the dedicated Chrome window open.'); }
     // Click once. Never resend an ambiguous submission: it could consume usage twice.
     try { await send.click(); }
     catch { throw new BrowserError('Could not click ChatGPT\'s Send button. Keep the dedicated Chrome window open and check the draft and conversation before retrying; no automatic resend was made.'); }
@@ -337,6 +324,46 @@ export class ChatGPTBrowser {
       await delay(100);
     }
     throw new BrowserError('The send button was clicked, but ChatGPT did not confirm accepting the message. Check the draft and conversation before retrying; no automatic resend was made.');
+  }
+
+  private async referencesReady(page: Page, names: string[]): Promise<boolean> {
+    if (await page.locator(this.config.selectors.uploadProgress).filter({ visible: true }).count()) return false;
+    if (!names.length) return true;
+    const previews = await page.locator(this.config.selectors.attachmentPreview).evaluateAll(elements => {
+      const cards = new Set<Element>();
+      return elements
+      .filter((element): element is HTMLImageElement => element instanceof HTMLImageElement)
+      .filter(img => img.getClientRects().length > 0 && img.complete && img.naturalWidth > 0)
+      .filter(img => {
+        const card = img.closest('.composer-attachment-surface, [data-testid="attachment-preview"], [role="group"]') ?? img;
+        if (cards.has(card)) return false;
+        cards.add(card);
+        return true;
+      })
+      .map(img => {
+        let busy = false;
+        for (let parent: Element | null = img; parent && parent !== document.body; parent = parent.parentElement) {
+          if (parent.getAttribute('aria-busy') === 'true') busy = true;
+        }
+        return { name: img.alt || img.closest('[role="group"][aria-label]')?.getAttribute('aria-label') || '', busy };
+      });
+    });
+    if (previews.some(preview => preview.busy)) return false;
+    // Consume each preview once: one thumbnail cannot satisfy multiple references.
+    const matched = new Set<number>();
+    return names.every(name => {
+      const parsed = path.parse(name);
+      const index = previews.findIndex((preview, index) => {
+        if (matched.has(index)) return false;
+        const uploaded = path.parse(preview.name);
+        return uploaded.ext === parsed.ext && (uploaded.name === parsed.name
+          // ChatGPT uses both collision counters and timestamp suffixes.
+          || uploaded.name.replace(/\s*\(\d+(?:-\d+)?\)$/, '') === parsed.name);
+      });
+      if (index < 0) return false;
+      matched.add(index);
+      return true;
+    });
   }
 
   private async visibleLimit(page: Page, responseText = ''): Promise<GenerationLimitNotice | undefined> {
@@ -368,7 +395,7 @@ export class ChatGPTBrowser {
       }
       await input.setInputFiles(images.map(image => image.path));
       const names = images.map(image => path.basename(image.path));
-      const deadline = Date.now() + Math.min(60_000, this.config.timeoutMs);
+      const deadline = Date.now() + this.config.timeoutMs;
       let readySince = 0;
       while (Date.now() < deadline) {
         const state = await this.inspect(page);
@@ -377,21 +404,7 @@ export class ChatGPTBrowser {
         if (alerts.some(text => /(?:upload|file|image|attachment).*(?:failed|error|unable|unsupported|too large|limit)|(?:failed|unable).*(?:upload|attach)/i.test(text))) {
           throw new BrowserError('ChatGPT rejected a reference image upload. No prompt was submitted. Inspect the upload error in Chrome.');
         }
-        const previews = await page.locator(this.config.selectors.attachmentPreview).evaluateAll(elements => elements
-          .filter((element): element is HTMLImageElement => element instanceof HTMLImageElement)
-          .filter(img => img.getClientRects().length > 0 && img.complete && img.naturalWidth > 0)
-          .map(img => img.alt || img.closest('[role="group"][aria-label]')?.getAttribute('aria-label') || ''));
-        const uploading = await page.locator(this.config.selectors.uploadProgress).filter({ visible: true }).count() > 0;
-        // ChatGPT may rename an upload, e.g. 1.png -> 1(2).png, after processing it.
-        const matches = names.every(name => {
-          const parsed = path.parse(name);
-          return previews.some(preview => {
-            const uploaded = path.parse(preview);
-            return uploaded.ext === parsed.ext && (uploaded.name === parsed.name
-              || uploaded.name.replace(/\s*\(\d+\)$/, '') === parsed.name);
-          });
-        });
-        if (matches && !uploading) {
+        if (await this.referencesReady(page, names)) {
           if (!readySince) readySince = Date.now();
           if (Date.now() - readySince >= 500) return;
         } else readySince = 0;
@@ -536,9 +549,6 @@ export class ChatGPTBrowser {
   }
 
   async close(): Promise<void> {
-    // Also stop an ordinary stage that is waiting for manual exit or whose close
-    // previously failed, before allowing this account's browser slot to switch.
-    await this.manualChrome?.close();
     await this.starting?.catch(() => {});
     try {
       if (this.context) {

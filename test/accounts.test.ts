@@ -281,8 +281,7 @@ test('named profiles resume queued jobs on worker startup and respect standalone
     await registry.use('login');
     const lockedResult = await connection.call('session_status');
     assert.equal(lockedResult.isError, undefined);
-    assert.equal(parsed(lockedResult).status, 'busy');
-    assert.deepEqual(parsed(lockedResult), { status: 'busy' });
+    assert.equal(parsed(lockedResult).status, 'login_required', 'Offline status does not acquire the standalone login lock');
     await release();
     const unlocked = parsed(await connection.call('list_jobs'));
     assert.ok(unlocked.jobs.some((job: any) => job.id === queued.id && job.account === undefined));

@@ -14,12 +14,14 @@ import { AccountManager, AccountRegistry } from '../src/accounts.js';
 import { JobStore } from '../src/store.js';
 import { JobQueue } from '../src/queue.js';
 import { createServer } from '../src/server.js';
+import { saveCookies } from '../src/session-store.js';
 
 test('all eleven tools return only useful public fields, keeping routing and full jobs private', { timeout: 5000 }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-compact-responses-'));
   const config = loadConfig({ CHATGPT_DATA_DIR: dir, CHATGPT_AUTO_SWITCH_ACCOUNTS: 'false' });
   const registry = new AccountRegistry(config);
   await registry.add('default');
+  await saveCookies(dir, [{ name: '__Secure-next-auth.session-token', value: 'fixture-session', domain: '.chatgpt.com', path: '/', expires: -1 }]);
   const store = new JobStore(dir);
   const browser = new ChatGPTBrowser(config);
   const bytes = await sharp({ create: { width: 300, height: 300, channels: 3, background: '#0066cc' } }).png().toBuffer();

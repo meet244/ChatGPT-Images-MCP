@@ -461,7 +461,7 @@ Submission failures now identify whether Send never became ready, the click fail
 
 ### Image limits and failed requests
 
-ChatGPT image limits still apply. A recognized image-limit failure starts this server's persisted **24-hour cooldown for that account**. `session_status` automatically switches from an exhausted profile to a ready fallback and returns the replacement account’s state. If saved, non-exhausted profiles exist but none is currently ready, it selects one and returns its actual `challenge`, `login_required`, or `unavailable` state, keeping the selected browser available for recovery. A profile in use returns `busy`; unreadable session data returns `unavailable`. These conditions do not become the exhausted account’s old usage-limit response. Status calls also return `busy` promptly while generation is running. Generation also skips exhausted profiles. Disabled switching or no available fallback return `blocked` with a concise `error` and `retryAfter` without queuing a new job.
+ChatGPT image limits still apply. A recognized image-limit failure starts this server's persisted **24-hour cooldown for that account**. `session_status` reads saved cookie expiry and recorded cooldown history without opening, navigating, or closing Chrome. It automatically selects another saved unexpired session when the preferred session has expired or has a cooldown. If all saved sessions have expired, it returns `login_required`; unreadable local session data returns `unavailable`. Status calls return `busy` promptly while generation is running. `ready` is a cached estimate: cookies without an expiry cannot prove that the remote session is still valid, and generation still checks live readiness. Generation also skips exhausted profiles. Disabled switching or no available fallback return `blocked` with a concise `error` and `retryAfter` without queuing a new job.
 
 The website's displayed reset text is retained internally as `limitReset`; it is separate from the server's 24-hour retry policy. Restarting does not clear the cooldown. Completed images remain available, and failed requests are not automatically replayed.
 
@@ -537,7 +537,7 @@ This runs headlessly and submits **one real ChatGPT image request**, waits for i
 
 | Tool | Purpose |
 | --- | --- |
-| `session_status` | Check readiness or cooldown for the server-selected session. |
+| `session_status` | Read saved session expiry and cooldown history; no browser opens. |
 | `generate_image` | Queue one image; accepts `prompt`, optional `reference_images`, and `aspect_ratio`. |
 | `generate_images` | Queue 1–25 prompts; accepts shared references, ratio, and optional `same_chat_mandatory`. |
 | `wait_for_job` | Wait 0–25 seconds; return only status and last update time, plus failure details if needed. |
@@ -555,11 +555,11 @@ Tool responses use compact JSON. `generate_image` returns only `{id, status}`; `
 
 One shared local worker serves both clients. Each account has its own FIFO queue, with up to 25 waiting jobs. Accepted work continues after clients disconnect. Queued jobs survive restarts; interrupted running jobs become failed, and remaining jobs in their batches stop. No uncertain prompt is automatically resubmitted. An explicit conversation-length rejection permits one automatic rollover to a new chat with the original references. A confirmed image usage limit, or an assumed limit after two consecutive completed text-only responses without images, also permits eligible jobs to continue on another signed-in account with those references.
 
-Live `session_status` checks and the terminal `status` command save the session and fully close their dedicated browser before returning, including when verification is required or the check fails. A busy status response leaves ongoing generation running.
+MCP `session_status` checks use local files and history only. The terminal `status` command still performs a live check, saves the session, and fully closes its dedicated browser before returning, including when verification is required or the check fails. A busy MCP status response leaves ongoing generation running.
 
 All accounts share one browser slot. Before opening another account, the server waits for current browser work to finish, saves the session, and fully closes the previous dedicated browser. Fallback checks run one account at a time; rejected profiles close before checking the next. If closing fails, switching stops instead of opening another window. Controlled Chrome keeps one reused ChatGPT tab and removes surplus tabs from its dedicated profile. Consecutive batch jobs on the same account reuse that browser; when its queues finish, it closes automatically. Saved accounts, conversations, and images remain available; the next generation reopens the required profile. Image retrieval reads saved files without opening Chrome. A browser cleanup failure does not change a completed image into a failed job.
 
-Fresh signed-in CDP browser starts use the same handoff as cookie setup: ordinary Chrome loads ChatGPT for 10 seconds, fully exits, and controlled Chrome opens the same account profile. Updated cookies and browser storage from the ordinary stage take precedence over saved snapshots. An already-open controlled browser is reused immediately, including for consecutive batch images. `CHATGPT_MANUAL_CLOSE_MS` changes the ordinary-stage delay; `0` waits for you to fully quit that dedicated Chrome. Complete any human verification in the visible browser if requested; the handoff preserves session state but cannot guarantee Cloudflare will never ask again. Both stages stay headless during tests.
+Image generation opens controlled Chrome directly once, using the existing account profile and saved session. An already-open controlled browser is reused, including for consecutive batch images. The ordinary-Chrome verification stage and automatic handoff run only during explicit cookie setup/import. `CHATGPT_MANUAL_CLOSE_MS` controls that setup stage; `0` waits for you to fully quit its dedicated Chrome. Complete any human verification if requested in the visible browser. Tests keep all browser launches headless.
 
 ## Configuration and local storage
 

@@ -18,6 +18,7 @@ import { ChatGPTBrowser, TextOnlyResponseError } from '../src/browser.js';
 import { JobStore, imageCooldownMs } from '../src/store.js';
 import { JobQueue } from '../src/queue.js';
 import { createServer } from '../src/server.js';
+import { saveCookies } from '../src/session-store.js';
 import { connectChrome, runningChrome, stopChrome } from '../src/chrome.js';
 
 function parseResult(result: any): any {
@@ -195,6 +196,7 @@ test('current gallery blob images finish without legacy assistant wrappers, and 
   const queue = new JobQueue(store, browser);
   const server = createServer(store, queue, browser);
   const client = new Client({ name: 'gallery-test', version: '1' });
+  await saveCookies(dir, [{ name: '__Secure-next-auth.session-token', value: 'fixture-session', domain: '.chatgpt.com', path: '/', expires: -1, secure: true, httpOnly: true }]);
   // This adapter test recovers an ephemeral blob URL from the still-live fixture page.
   // Automatic shutdown and reopening are covered by the complete generation flow below.
   queue.setIdleHandler(async () => {});
@@ -202,6 +204,8 @@ test('current gallery blob images finish without legacy assistant wrappers, and 
   let observer;
   try {
     await server.connect(serverTransport); await client.connect(clientTransport);
+    // Initialize this live adapter fixture explicitly; MCP status now stays offline.
+    assert.equal((await browser.sessionStatus()).status, 'ready');
     assert.equal(parseResult(await client.callTool({ name: 'session_status', arguments: {} })).status, 'ready');
     const job = parseResult(await client.callTool({ name: 'generate_image', arguments: { prompt: 'A green landscape' } }));
     let status = job;
@@ -362,6 +366,7 @@ for (const mode of ['playwright', 'cdp', 'webkit'] as const) test(`MCP → queue
     const cookieFile = path.join(dir, 'cookies.json');
     await writeFile(cookieFile, JSON.stringify([{ name: 'fixture-session', value: 'fixture-secret', domain: '.chatgpt.com', path: '/', secure: true, httpOnly: true, expires: Date.now() / 1000 + 3600 }]));
     assert.equal(await browser.importCookies(cookieFile), 1);
+    await saveCookies(dir, [{ name: '__Secure-next-auth.session-token', value: 'fixture-session', domain: '.chatgpt.com', path: '/', expires: -1, secure: true, httpOnly: true }]);
     if (mode !== 'webkit') {
       assert.match(await (await browser.open()).evaluate(() => navigator.userAgent), /HeadlessChrome/, 'Chromium integration fixtures always run headlessly');
     }

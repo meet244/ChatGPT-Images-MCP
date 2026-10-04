@@ -1,6 +1,8 @@
 import './support/headless.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { createServer } from 'node:http';
 import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -124,31 +126,32 @@ test('cookie import seeds a named profile, opens ordinary Chrome first, and pres
   }
 });
 
-test('cold generation loads ordinary Chrome before controlled Chrome, preserving its cookies without another setup', { timeout: 35_000 }, async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'images-generation-handoff-'));
-  const config = loadConfig({ CHATGPT_DATA_DIR: dir, CHATGPT_MANUAL_CLOSE_MS: '3000', CHATGPT_POLL_MS: '100' });
+test('cold generation launches Chrome once, reuses it, and preserves the signed-in profile', { timeout: 35_000 }, async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'images-generation-single-open-'));
+  const config = loadConfig({ CHATGPT_DATA_DIR: dir, CHATGPT_POLL_MS: '100' });
   const png = await sharp({ create: { width: 300, height: 300, channels: 3, background: '#26a269' } }).png().toBuffer();
   let ordinaryVisits = 0;
   let submissions = 0;
   const controlledVisits: string[] = [];
-  const ordinaryCookies: string[] = [];
+  const launches: string[][] = [];
+  const spawn = childProcess.spawn;
+  t.mock.method(childProcess, 'spawn', (command, args, options) => {
+    if (Array.isArray(args) && args.includes(`--user-data-dir=${chromeProfile(config)}`)) launches.push([...args]);
+    return spawn(command, args, options);
+  });
+  syncBuiltinESMExports();
   const fixture = createServer((req, res) => {
     void (async () => {
       if (req.url === '/image.png') { res.setHeader('content-type', 'image/png'); res.end(png); return; }
       if (req.url === '/submitted') { submissions++; res.end('ok'); return; }
-      if (req.url === '/ordinary-cookie') { ordinaryCookies.push(req.headers.cookie ?? ''); res.end('ok'); return; }
       if (req.url !== '/') { res.end('ok'); return; }
-      const controlled = Boolean(await runningChrome(config));
-      if (!controlled) {
-        ordinaryVisits++;
-        res.setHeader('set-cookie', `fixture-clearance=ordinary-${ordinaryVisits}; Path=/; Max-Age=3600`);
-      } else controlledVisits.push(req.headers.cookie ?? '');
+      if (!await runningChrome(config)) ordinaryVisits++;
+      else controlledVisits.push(req.headers.cookie ?? '');
       res.setHeader('content-type', 'text/html');
       res.end(`<textarea id="prompt-textarea"></textarea><button data-testid="send-button">Send</button><main></main><script>
-        ${controlled ? '' : `localStorage.setItem('ordinary-stage', '${ordinaryVisits}'); fetch('/ordinary-cookie');`}
         document.querySelector('button').onclick = () => {
           fetch('/submitted');
-          history.pushState({}, '', '/c/handoff-fixture');
+          history.pushState({}, '', '/c/single-open-fixture');
           document.querySelector('main').innerHTML = '<article data-turn="assistant"><img src="/image.png" alt="Generated image: fixture"></article>';
         };
       </script>`);
@@ -158,32 +161,37 @@ test('cold generation loads ordinary Chrome before controlled Chrome, preserving
   const baseUrl = `http://127.0.0.1:${(fixture.address() as { port: number }).port}/`;
   const browser = new ChatGPTBrowser(config, { baseUrl });
   try {
-    // Seed an existing signed-in profile without going through interactive setup.
     const fresh = parseCookieInput('__Secure-next-auth.session-token=fresh-profile-fixture');
     await browser.importCookieValues(fresh);
+    const initialPage = await browser.open();
+    await initialPage.evaluate(() => localStorage.setItem('verified-profile', 'retained'));
+    await initialPage.context().addCookies([{ name: 'fixture-clearance', value: 'verified-clearance', url: baseUrl, expires: Date.now() / 1000 + 3600 }]);
     await browser.shutdown();
     for (let attempt = 1; attempt <= 2; attempt++) {
-      // An older snapshot must not restore obsolete split tokens or clearance.
+      // Existing Chrome tokens take precedence over an older saved snapshot.
       await saveCookies(dir, parseCookieInput('__Secure-next-auth.session-token.0=stale0, __Secure-next-auth.session-token.1=stale1'));
-      const result = await browser.generate(`handoff-${attempt}`, 'A green square', () => {});
+      const before = launches.length;
+      const result = await browser.generate(`single-open-${attempt}`, 'A green square', () => {});
       assert.equal(result.images.length, 1);
-      assert.equal(ordinaryVisits, attempt, 'Exactly one ordinary load per cold generation start');
-      assert.equal(ordinaryCookies.at(-1), `fixture-clearance=ordinary-${attempt}`, 'Ordinary Chrome receives its new verification cookie before closing');
-      assert.match(controlledVisits.at(-1)!, new RegExp(`fixture-clearance=ordinary-${attempt}`), 'The controlled request uses the ordinary browser cookie');
+      assert.equal(launches.length, before + 1, 'Exactly one Chrome process starts for a cold generation');
+      assert.ok(launches.at(-1)!.includes('--remote-debugging-port=0'), 'The single launch is controlled Chrome');
+      assert.equal(ordinaryVisits, 0, 'Generation never opens an ordinary warmup browser');
+      assert.match(controlledVisits.at(-1)!, /fixture-clearance=verified-clearance/);
       const page = await browser.open();
-      assert.equal(await page.evaluate(() => localStorage.getItem('ordinary-stage')), String(attempt));
+      assert.equal(await page.evaluate(() => localStorage.getItem('verified-profile')), 'retained');
       assert.match(await page.evaluate(() => navigator.userAgent), /HeadlessChrome/);
       assert.deepEqual(page.context().pages().map(p => p.url()), [baseUrl]);
       assert.deepEqual((await page.context().cookies('https://chatgpt.com')).map(c => c.value), ['fresh-profile-fixture']);
-      assert.deepEqual((await readSavedCookies(dir)).map(c => c.value), ['fresh-profile-fixture']);
       await Promise.all([browser.sessionStatus(), browser.sessionStatus()]);
-      assert.equal(ordinaryVisits, attempt, 'Live session checks do not restart ordinary Chrome');
+      assert.equal(launches.length, before + 1, 'Opening and checking the running browser does not relaunch it');
       await browser.shutdown();
       assert.equal(await runningChrome(config), undefined);
+      assert.deepEqual((await readSavedCookies(dir)).map(c => c.value), ['fresh-profile-fixture']);
     }
     assert.equal(submissions, 2, 'Each request submits its prompt only once');
   } finally {
     await browser.shutdown();
+    t.mock.restoreAll(); syncBuiltinESMExports();
     await new Promise<void>(resolve => fixture.close(() => resolve()));
     await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
