@@ -1,9 +1,14 @@
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 
 export const projectRoot = fileURLToPath(new URL('../', import.meta.url));
-dotenv.config({ path: path.join(projectRoot, '.env'), quiet: true });
+// npm replaces packages under node_modules on update, so package installs keep
+// .env and private data in the home directory. Source checkouts keep them here.
+const packaged = projectRoot.split(path.sep).includes('node_modules');
+export const settingsRoot = packaged ? path.join(os.homedir(), '.chatgpt-images-mcp') : projectRoot;
+dotenv.config({ path: path.join(settingsRoot, '.env'), quiet: true });
 
 export interface Config {
   dataDir: string;
@@ -34,13 +39,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (browserMode !== 'cdp' && browserMode !== 'playwright' && browserMode !== 'webkit') throw new Error('CHATGPT_BROWSER_MODE must be cdp, playwright, or webkit.');
   if (browserMode === 'cdp' && headless === 'true') throw new Error('CDP mode uses visible Chrome. Set CHATGPT_HEADLESS=false or use CHATGPT_BROWSER_MODE=playwright.');
   return {
-    dataDir: path.resolve(projectRoot, env.CHATGPT_DATA_DIR ?? '.chatgpt-images'),
+    dataDir: path.resolve(settingsRoot, env.CHATGPT_DATA_DIR ?? (packaged ? 'data' : '.chatgpt-images')),
     headless: headless === 'true',
     browserMode,
     autoSwitchAccounts: autoSwitchAccounts === 'true',
     manualCloseMs: integer(env, 'CHATGPT_MANUAL_CLOSE_MS', 10_000, 0, 600_000),
-    chromeExecutable: env.CHATGPT_CHROME_EXECUTABLE ? path.resolve(projectRoot, env.CHATGPT_CHROME_EXECUTABLE) : undefined,
-    cookiesFile: env.CHATGPT_COOKIES_FILE ? path.resolve(projectRoot, env.CHATGPT_COOKIES_FILE) : undefined,
+    chromeExecutable: env.CHATGPT_CHROME_EXECUTABLE ? path.resolve(settingsRoot, env.CHATGPT_CHROME_EXECUTABLE) : undefined,
+    cookiesFile: env.CHATGPT_COOKIES_FILE ? path.resolve(settingsRoot, env.CHATGPT_COOKIES_FILE) : undefined,
     channel: env.CHATGPT_BROWSER_CHANNEL || undefined,
     timeoutMs: integer(env, 'CHATGPT_TIMEOUT_MS', 300_000, 10_000, 1_800_000),
     pollMs: integer(env, 'CHATGPT_POLL_MS', 2_000, 100, 30_000),

@@ -7,11 +7,15 @@
   "engines": {
     "node": ">=22"
   },
+  "files": [
+    "dist"
+  ],
   "bin": {
     "chatgpt-images-mcp": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "start": "node dist/index.js serve",
     "dev": "tsx src/index.ts serve",
     "login": "tsx src/index.ts login",
