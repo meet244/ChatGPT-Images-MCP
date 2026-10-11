@@ -338,8 +338,8 @@ Tests use local fixture pages and fake sessions, so they don't use any ChatGPT i
 ### Releasing
 
 1. Update `version` in `package.json` and add a section to [CHANGELOG.md](CHANGELOG.md).
-2. Commit, then tag and push: `git tag v0.2.0 && git push --follow-tags`.
-3. The Release workflow runs the tests on macOS and publishes to npm. It needs an npm access token saved as the repository secret `NPM_TOKEN` (Settings → Secrets and variables → Actions).
+2. Run `npm test`, then commit, tag and push: `git tag v0.2.0 && git push --follow-tags`.
+3. Publish from the project folder with `npm publish` (run `npm login` first if needed). Publishing rebuilds `dist/` automatically.
 
 ## Notes
 
