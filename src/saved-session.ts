@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { Config } from './config.js';
+import { cli } from './config.js';
 import { hasSessionCookies, parseCookieInput } from './cookies.js';
 
 export interface SavedSessionStatus {
@@ -11,10 +12,22 @@ export interface SavedSessionStatus {
   reason?: 'missing' | 'expired';
 }
 
+/** Earliest saved session-token expiry in milliseconds, or undefined for browser-session or missing tokens. */
+export async function savedSessionExpiry(config: Config): Promise<number | undefined> {
+  try {
+    const input: unknown = JSON.parse(await readFile(path.join(config.dataDir, 'session-cookies.json'), 'utf8'));
+    if (!Array.isArray(input)) return undefined;
+    const sessionName = /^(?:__Secure-)?(?:next-auth|authjs)\.session-token(?:\.\d+)?$/;
+    const expiries = input.filter(cookie => cookie && typeof cookie === 'object' && sessionName.test(String(cookie.name)))
+      .map(cookie => Number(cookie.expires)).filter(expires => Number.isFinite(expires) && expires > 0);
+    return expiries.length ? Math.min(...expiries) * 1000 : undefined;
+  } catch { return undefined; }
+}
+
 /** Local expiry is an estimate of readiness, not a check of remote revocation. */
 export async function inspectSavedSession(config: Config): Promise<SavedSessionStatus> {
-  const missing = { status: 'login_required' as const, reason: 'missing' as const, message: 'No saved session. Run setup for this account.' };
-  const expiredSession = { status: 'login_required' as const, reason: 'expired' as const, message: 'Saved session has expired. Run setup for this account.' };
+  const missing = { status: 'login_required' as const, reason: 'missing' as const, message: `No saved session. Run ${cli('manage-accounts')} to sign in to this account.` };
+  const expiredSession = { status: 'login_required' as const, reason: 'expired' as const, message: `Saved session has expired. Run ${cli('manage-accounts')} and sign in to this account again.` };
   try {
     const input: unknown = JSON.parse(await readFile(config.cookiesFile ?? path.join(config.dataDir, 'session-cookies.json'), 'utf8'));
     const items = Array.isArray(input) ? input
@@ -36,6 +49,6 @@ export async function inspectSavedSession(config: Config): Promise<SavedSessionS
     return hasSessionCookies(cookies) ? { status: 'ready' } : expired.size ? expiredSession : missing;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return missing;
-    return { status: 'unavailable', message: 'Saved session could not be read. Run setup for this account.' };
+    return { status: 'unavailable', message: `Saved session could not be read. Run ${cli('manage-accounts')} and sign in to this account again.` };
   }
 }

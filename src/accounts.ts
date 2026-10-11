@@ -4,6 +4,7 @@ import { chmod, mkdir, readdir, readFile, rename, rm, rmdir, stat, writeFile } f
 import Database from 'better-sqlite3';
 import lockfile from 'proper-lockfile';
 import type { Config } from './config.js';
+import { cli } from './config.js';
 import { ChatGPTBrowser, BrowserError, TextOnlyResponseError, type GenerationOptions } from './browser.js';
 import { JobStore, imageCooldownMs, type ImageCooldown, type Job } from './store.js';
 import { JobQueue, CooldownError, BatchRestartError } from './queue.js';
@@ -22,12 +23,15 @@ interface AccountSettings {
   mode: 'priority' | 'manual';
   selected?: string;
   legacyDefaultDeleted?: boolean;
-  accounts: Record<string, { label?: string; priority?: number }>;
+  accounts: Record<string, { label?: string; priority?: number; email?: string; plan?: string }>;
 }
+export interface AccountProfile { email?: string; plan?: string }
+const validEmail = (value: unknown): boolean => typeof value === 'string' && /^[^\s@\x00-\x1f]{1,64}@[^\s@\x00-\x1f]{1,190}$/.test(value);
+const validPlan = (value: unknown): boolean => typeof value === 'string' && /^[a-z0-9_-]{1,32}$/.test(value);
 const defaultPriority = 100;
 
 export class NoAccountsError extends Error {
-  constructor() { super('No accounts configured. Run npm run accounts:manage and add an account first.'); }
+  constructor() { super(`No accounts configured. Run ${cli('manage-accounts')} in a terminal and add an account first.`); }
 }
 
 /** Existing root-level sessions retain their paths; new installations start empty. */
@@ -44,7 +48,8 @@ export class AccountRegistry {
       for (const [name, entry] of Object.entries(value.accounts)) {
         if (!accountNamePattern.test(name) || !entry || typeof entry !== 'object'
           || (entry.label !== undefined && (typeof entry.label !== 'string' || !entry.label.trim() || entry.label.length > 80 || /[\x00-\x1f\x7f]/.test(entry.label)))
-          || (entry.priority !== undefined && (!Number.isInteger(entry.priority) || entry.priority < 0 || entry.priority > 999999))) throw new Error();
+          || (entry.priority !== undefined && (!Number.isInteger(entry.priority) || entry.priority < 0 || entry.priority > 999999))
+          || (entry.email !== undefined && !validEmail(entry.email)) || (entry.plan !== undefined && !validPlan(entry.plan))) throw new Error();
       }
       return value;
     } catch (error) {
@@ -79,6 +84,32 @@ export class AccountRegistry {
     await this.updateSettings(async settings => {
       await this.require(name);
       settings.accounts[name] = { ...settings.accounts[name], priority };
+    });
+  }
+  /** Detected after sign-in; shown in the terminal menu only, never in MCP responses. */
+  async setProfile(name: string, profile: AccountProfile): Promise<void> {
+    await this.require(name);
+    if ((profile.email !== undefined && !validEmail(profile.email)) || (profile.plan !== undefined && !validPlan(profile.plan))) throw new Error('Account details could not be saved.');
+    await this.updateSettings(async settings => {
+      await this.require(name);
+      settings.accounts[name] = { ...settings.accounts[name], ...(profile.email ? { email: profile.email } : {}), ...(profile.plan ? { plan: profile.plan } : {}) };
+    });
+  }
+  async profile(name: string): Promise<AccountProfile> {
+    const entry = (await this.settings()).accounts[name];
+    return { ...(entry?.email ? { email: entry.email } : {}), ...(entry?.plan ? { plan: entry.plan } : {}) };
+  }
+  /** Swap with the neighbouring account in priority order; priorities are renumbered to keep the order strict. */
+  async move(name: string, direction: -1 | 1): Promise<void> {
+    await this.require(name);
+    await this.updateSettings(async settings => {
+      const [names, active] = await Promise.all([this.names(), this.active()]);
+      const order = names.sort((a, b) => (settings.accounts[b]?.priority ?? defaultPriority) - (settings.accounts[a]?.priority ?? defaultPriority)
+        || Number(b === active) - Number(a === active) || a.localeCompare(b));
+      const index = order.indexOf(name), target = index + direction;
+      if (index < 0 || target < 0 || target >= order.length) return;
+      [order[index], order[target]] = [order[target]!, order[index]!];
+      order.forEach((account, position) => { settings.accounts[account] = { ...settings.accounts[account], priority: order.length - position }; });
     });
   }
   async select(name: string): Promise<void> {
@@ -135,7 +166,7 @@ export class AccountRegistry {
   async require(name: string | undefined): Promise<Config> {
     if (name === undefined) throw new NoAccountsError();
     validateAccountName(name);
-    if (!(await this.names()).includes(name)) throw new Error(`Unknown account '${name}'. Add it with account-add --account ${name}, then sign in.`);
+    if (!(await this.names()).includes(name)) throw new Error(`Unknown account '${name}'. Add it with ${cli('manage-accounts')}, then sign in.`);
     return name === 'default' ? { ...this.baseConfig } : {
       ...this.baseConfig, dataDir: path.join(this.directory, name),
       // A global cookie import belongs only to the original account.
@@ -150,7 +181,7 @@ export class AccountRegistry {
       return names.includes(saved) ? saved : names[0];
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return names[0];
-      throw new Error('The selected account setting is invalid. Run npm run accounts:manage and select an account to repair it.');
+      throw new Error(`The selected account setting is invalid. Run ${cli('manage-accounts')} and select an account to repair it.`);
     }
   }
   async add(name: string): Promise<Config> {
@@ -176,7 +207,7 @@ export class AccountRegistry {
     catch (error) {
       // Only remove an empty profile created by this call if settings could not be saved.
       if (created) await rmdir(directory).catch(() => {});
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`Account '${name}' already exists. Use setup --account ${name} to finish signing in.`);
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`Account '${name}' already exists. Use ${cli(`setup --account ${name}`)} to finish signing in.`);
       throw error;
     }
     return this.require(name);
@@ -226,7 +257,7 @@ export class AccountRegistry {
         const browser = new ChatGPTBrowser(config);
         return { account: name, display_name: settings.accounts[name]?.label ?? name, priority: settings.accounts[name]?.priority ?? defaultPriority, active: name === active, has_saved_session: await browser.hasSavedSession() };
       } catch {
-        return { account: name, display_name: settings.accounts[name]?.label ?? name, priority: settings.accounts[name]?.priority ?? defaultPriority, active: name === active, has_saved_session: false, error: 'Saved session could not be read. Run setup for this account.' };
+        return { account: name, display_name: settings.accounts[name]?.label ?? name, priority: settings.accounts[name]?.priority ?? defaultPriority, active: name === active, has_saved_session: false, error: `Saved session could not be read. Run ${cli('manage-accounts')} and sign in to this account again.` };
       }
     }));
     accounts.sort((a, b) => b.priority - a.priority || Number(b.active) - Number(a.active) || a.account.localeCompare(b.account));
@@ -367,7 +398,7 @@ export class AccountManager {
         state = saved.reason === 'expired' ? saved
           : cooldown ? { status: 'usage_limit', retryAfter: cooldown.retryAfter } : saved;
       } catch {
-        state = { status: 'unavailable', message: 'Saved session history could not be read. Run setup for this account.' };
+        state = { status: 'unavailable', message: `Saved session history could not be read. Run ${cli('manage-accounts')} and sign in to this account again.` };
       }
       if (account === manual && state.reason) replaceManual = true;
       if (state.status === 'ready') {
@@ -458,7 +489,7 @@ export class AccountManager {
         if (this.closing) throw new Error('Server is shutting down.');
         if (allowUnready && eligible) unready ??= eligible;
         else if (allowUnready) selectionError ??= error instanceof AccountSelectionError ? error
-          : new AccountSelectionError(name, 'unavailable', `Saved session for account '${name}' could not be checked. Run setup for this account to repair it.`);
+          : new AccountSelectionError(name, 'unavailable', `Saved session for account '${name}' could not be checked. Run ${cli('manage-accounts')} and sign in to it again.`);
       }
     }
     // Session checks must show an existing replacement's verification/login/error
@@ -594,6 +625,32 @@ export class AccountManager {
       const pending = await this.registry.inspectDatabase(name, db => db.prepare("SELECT 1 FROM jobs WHERE status IN ('queued', 'running') LIMIT 1").get());
       if (pending) await this.resolve(name);
     }
+  }
+  /**
+   * Let a terminal command repair an idle account's session while this worker runs.
+   * Only an idle worker releases a profile; the next request reopens it as usual.
+   */
+  async release(name: string): Promise<'released' | 'not_open' | 'busy' | 'unsupported'> {
+    // The original account shares the worker's own data-directory lock.
+    if (name === 'default') return 'unsupported';
+    if (this.closing || this.isBusy()) return 'busy';
+    const runtime = this.runtimes.get(name);
+    if (!runtime) return 'not_open';
+    return this.withBrowser(runtime, async () => {
+      if (this.runtimes.get(name) !== runtime || this.profileNeeded(runtime) || (this.browserOperations.get(name)?.count ?? 0) > 1) return 'busy';
+      if (this.activeBrowser === runtime) {
+        await runtime.browser.shutdown();
+        this.activeBrowser = undefined;
+      }
+      this.runtimes.delete(name);
+      this.closeCandidates.delete(name);
+      try { await runtime.queue.stop(); }
+      finally {
+        try { runtime.store.close(); }
+        finally { await this.releases.get(name)?.(); this.releases.delete(name); }
+      }
+      return 'released';
+    }, false);
   }
   isBusy(): boolean {
     return this.opening.size > 0 || [...this.browserOperations.values()].some(operations => operations.count > 0)

@@ -1,14 +1,47 @@
 import os from 'node:os';
 import path from 'node:path';
+import { accessSync, constants, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 
 export const projectRoot = fileURLToPath(new URL('../', import.meta.url));
+export const packageName = 'chatgpt-images-mcp';
 // npm replaces packages under node_modules on update, so package installs keep
 // .env and private data in the home directory. Source checkouts keep them here.
 const packaged = projectRoot.split(path.sep).includes('node_modules');
 export const settingsRoot = packaged ? path.join(os.homedir(), '.chatgpt-images-mcp') : projectRoot;
 dotenv.config({ path: path.join(settingsRoot, '.env'), quiet: true });
+
+/** How this copy was installed: run through npx, installed with npm -g, or a source checkout. */
+export const installKind: 'npx' | 'global' | 'source' = !packaged ? 'source'
+  : projectRoot.split(path.sep).includes('_npx') ? 'npx' : 'global';
+
+/** A terminal command that works for this installation, e.g. cli('setup --account work'). */
+export function cli(args = ''): string {
+  const base = installKind === 'npx' ? `npx ${packageName}` : installKind === 'global' ? packageName : 'npm run cli --';
+  return args ? `${base} ${args}` : base;
+}
+
+/** The command an MCP client should launch to reach this installation's server. */
+export function launchCommand(): { command: string; args: string[] } {
+  // The npx cache path changes between versions; the package name does not.
+  if (installKind === 'npx') return { command: 'npx', args: ['-y', `${packageName}@latest`] };
+  return { command: stableNode(), args: [path.join(projectRoot, 'dist', 'index.js'), 'serve'] };
+}
+
+/** Prefer the PATH entry for this Node (e.g. a Homebrew symlink) over a versioned path that breaks on upgrade. */
+function stableNode(): string {
+  let current: string;
+  try { current = realpathSync(process.execPath); } catch { return process.execPath; }
+  for (const directory of (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(directory, process.platform === 'win32' ? 'node.exe' : 'node');
+    try {
+      accessSync(candidate, constants.X_OK);
+      if (realpathSync(candidate) === current) return candidate;
+    } catch { /* Not this directory. */ }
+  }
+  return process.execPath;
+}
 
 export interface Config {
   dataDir: string;

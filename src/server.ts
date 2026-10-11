@@ -8,6 +8,7 @@ import { JobStore, type Job, type Batch, type ImageArtifact } from './store.js';
 import { JobQueue, CooldownError } from './queue.js';
 import { ChatGPTBrowser } from './browser.js';
 import { maxReferenceImages } from './references.js';
+import { cli } from './config.js';
 import { AccountManager, NoAccountsError, accountNamePattern, type AccountRuntime } from './accounts.js';
 
 const textResult = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }] });
@@ -191,7 +192,7 @@ export function createServer(store: JobStore, queue: JobQueue, browser: ChatGPTB
   });
   if (accounts) {
     server.registerTool('list_accounts', {
-      description: 'List only local profile IDs, display names, saved-session availability, and active selection without opening browsers or checking live readiness. Manage names, priorities and selection with npm run accounts:manage. Use session_status for cached expiry and cooldown checks.',
+      description: 'List only local profile IDs, display names, saved-session availability, and active selection without opening browsers or checking live readiness. Manage names, order and selection in a terminal with ' + cli('manage-accounts') + '. Use session_status for cached expiry and cooldown checks.',
       inputSchema: z.object({}).strict(),
       annotations: { readOnlyHint: true, openWorldHint: false },
     }, async () => {
@@ -207,7 +208,7 @@ export function createServer(store: JobStore, queue: JobQueue, browser: ChatGPTB
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async ({ account }) => {
       await accounts.registry.add(account);
-      return textResult({ account, status: 'login_required', message: `Run npm run setup -- --account ${account} to sign in.` });
+      return textResult({ account, status: 'login_required', message: `Run ${cli(`setup --account ${account}`)} in a terminal to sign in.` });
     });
   }
   return server;

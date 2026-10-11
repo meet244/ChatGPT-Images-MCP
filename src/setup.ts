@@ -2,6 +2,7 @@ import { BrowserError, type ChatGPTBrowser, type SessionStatus } from './browser
 import { parseCookieInput, type BrowserCookie } from './cookies.js';
 import { question, readCookieInput } from './terminal.js';
 import { finishManualChrome } from './chrome.js';
+import { cli } from './config.js';
 
 export interface SetupBrowser {
   hasSavedSession(): Promise<boolean>;
@@ -11,6 +12,7 @@ export interface SetupBrowser {
   open: ChatGPTBrowser['open'];
   closeAfterSetup: ChatGPTBrowser['closeAfterSetup'];
   prepareManualCookieSession?: ChatGPTBrowser['prepareManualCookieSession'];
+  accountProfile?: ChatGPTBrowser['accountProfile'];
 }
 export interface SetupTerminal {
   question(prompt: string): Promise<string>;
@@ -19,7 +21,7 @@ export interface SetupTerminal {
 }
 const terminal: SetupTerminal = { question, readCookies: readCookieInput, print: message => { process.stderr.write(`${message}\n`); } };
 
-export async function importCookiesWithVerification(browser: SetupBrowser, cookies: BrowserCookie[], io: SetupTerminal = terminal): Promise<{ count: number; state: SessionStatus }> {
+export async function importCookiesWithVerification(browser: SetupBrowser, cookies: BrowserCookie[], io: SetupTerminal = terminal): Promise<{ count: number; state: SessionStatus; profile?: { email?: string; plan?: string } }> {
   const manual = await browser.prepareManualCookieSession?.(cookies);
   let count: number;
   if (manual) {
@@ -39,7 +41,12 @@ export async function importCookiesWithVerification(browser: SetupBrowser, cooki
   }
   const settleMs = manual ? (manual.autoCloseMs || 10_000) : 0;
   if (settleMs > 0) io.print(`Controlled Chrome will stay open for at least ${settleMs / 1000} seconds before checking and closing. Complete any verification in this window too.`);
-  try { return { count, state: await browser.sessionStatus(true, settleMs) }; }
+  try {
+    const state = await browser.sessionStatus(true, settleMs);
+    // Read the account's email and plan while the signed-in page is still open.
+    const profile = state.status === 'ready' ? await browser.accountProfile?.() : undefined;
+    return { count, state, ...(profile ? { profile } : {}) };
+  }
   finally {
     await browser.closeAfterSetup();
     io.print('Session browser closed. The saved login is retained; the MCP will reopen the browser when needed.');
@@ -47,7 +54,7 @@ export async function importCookiesWithVerification(browser: SetupBrowser, cooki
 }
 
 export async function checkSavedSession(browser: SetupBrowser): Promise<SessionStatus> {
-  if (!await browser.hasSavedSession()) return { status: 'login_required', message: 'No saved session token was found. Run npm run setup and choose Log in or Paste cookies.' };
+  if (!await browser.hasSavedSession()) return { status: 'login_required', message: `No saved session token was found. Run ${cli('setup')} and choose Log in or Paste cookies.` };
   return browser.sessionStatus();
 }
 
@@ -58,7 +65,7 @@ export async function setupSession(browser: SetupBrowser, headless: boolean, io:
   catch (error) {
     state = { status: 'unavailable', message: error instanceof BrowserError
       ? error.message
-      : 'The saved session could not be checked. Run npm run status for diagnostics, or npm run paste-cookies to explicitly replace saved cookies.' };
+      : `The saved session could not be checked. Run ${cli('status')} for diagnostics, or ${cli('paste-cookies')} to explicitly replace saved cookies.` };
   }
   if (state.status === 'ready') { io.print('ChatGPT session is ready.'); return state; }
   io.print(state.message);

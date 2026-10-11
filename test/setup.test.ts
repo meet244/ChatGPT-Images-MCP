@@ -373,3 +373,17 @@ test('the session browser closes after unsuccessful or throwing readiness checks
     assert.equal(fixture.imported().length, 2);
   }
 });
+
+test('cookie import reads the account email and plan before closing, only when the session is ready', async () => {
+  const fixture = setupFixture(false, []);
+  const events: string[] = [];
+  fixture.browser.accountProfile = async () => { events.push('profile'); return { email: 'person@example.com', plan: 'plus' }; };
+  fixture.browser.closeAfterSetup = async () => { events.push('close'); };
+  const ready = await importCookiesWithVerification(fixture.browser, parseCookieInput(paste), fixture.io);
+  assert.deepEqual(ready.profile, { email: 'person@example.com', plan: 'plus' });
+  assert.deepEqual(events, ['profile', 'close']);
+  fixture.browser.sessionStatus = async () => ({ status: 'challenge', message: 'Verify' });
+  const unready = await importCookiesWithVerification(fixture.browser, parseCookieInput(paste), fixture.io);
+  assert.equal(unready.profile, undefined);
+  assert.deepEqual(events, ['profile', 'close', 'close']);
+});

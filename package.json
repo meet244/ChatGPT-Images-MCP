@@ -1,14 +1,32 @@
 {
   "name": "chatgpt-images-mcp",
   "version": "0.1.0",
-  "description": "Local MCP server for image generation through the ChatGPT browser interface",
+  "description": "MCP server for Claude Code and Codex that generates images with your own signed-in ChatGPT account. No OpenAI API key needed.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "chatgpt",
+    "image-generation",
+    "claude-code",
+    "codex"
+  ],
+  "author": "Meet Patel",
+  "license": "MIT",
+  "homepage": "https://github.com/meet244/ChatGPT-Images-MCP#readme",
+  "bugs": {
+    "url": "https://github.com/meet244/ChatGPT-Images-MCP/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meet244/ChatGPT-Images-MCP.git"
+  },
   "type": "module",
-  "private": true,
   "engines": {
     "node": ">=22"
   },
   "files": [
-    "dist"
+    "dist/**/*.js",
+    "npm-shrinkwrap.json"
   ],
   "bin": {
     "chatgpt-images-mcp": "dist/index.js"
@@ -37,9 +55,11 @@
     "recover": "tsx src/index.ts recover",
     "check": "tsc --noEmit",
     "browser:install": "playwright install chromium",
-    "browser:install:webkit": "playwright install webkit"
+    "browser:install:webkit": "playwright install webkit",
+    "cli": "node dist/index.js"
   },
   "dependencies": {
+    "@clack/prompts": "^1.8.1",
     "@modelcontextprotocol/server": "^2.2.0",
     "better-sqlite3": "^13.0.3",
     "dotenv": "^18.0.5",

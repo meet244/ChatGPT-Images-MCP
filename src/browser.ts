@@ -4,6 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, webkit, type Browser, type BrowserContext, type Page, type Locator } from 'playwright';
 import sharp from 'sharp';
 import type { Config } from './config.js';
+import { cli } from './config.js';
 import { readCookies, normalizeCookies, hasSessionCookies, type BrowserCookie } from './cookies.js';
 import { readSavedCookies, saveCookies } from './session-store.js';
 import { inspectSavedSession } from './saved-session.js';
@@ -100,8 +101,8 @@ export class ChatGPTBrowser {
       throw new BrowserError(this.config.browserMode === 'cdp'
         ? (error instanceof ChromeError ? error.message : 'Could not initialize dedicated Chrome. Check the saved cookies and run browser-close before trying again.')
         : this.config.browserMode === 'webkit'
-          ? 'Cannot start WebKit. Run npm run browser:install:webkit and ensure its dedicated profile is not already open.'
-          : 'Cannot start the browser. Run npm run browser:install, check CHATGPT_BROWSER_CHANNEL, and ensure the profile is not already open.');
+          ? 'Cannot start WebKit. Run npx playwright install webkit and ensure its dedicated profile is not already open.'
+          : 'Cannot start the browser. Run npx playwright install chromium, check CHATGPT_BROWSER_CHANNEL, and ensure the profile is not already open.');
     }
   }
 
@@ -167,17 +168,65 @@ export class ChatGPTBrowser {
     const challengeTitle = /^(?:just a moment(?:\.{3}|…)?|access denied|attention required!?)(?:\s*[-|].*)?$/i.test(title.trim());
     if (challengeTitle || /verify you are human|checking your browser|performing security verification|access denied/i.test(text)) {
       return { status: 'challenge', message: this.config.browserMode === 'cdp'
-        ? 'ChatGPT requires browser verification. Run npm run login for this account and complete the checkbox, then check session_status again.'
-        : 'ChatGPT requires browser verification. Run npm run login and complete it in the visible browser.' };
+        ? `ChatGPT requires browser verification. Run ${cli('manage-accounts')}, select this account, choose "Sign in again with Chrome" and complete the check. Then check session_status again.`
+        : `ChatGPT requires browser verification. Run ${cli('manage-accounts')}, select this account and choose "Sign in again with Chrome" to complete it in a visible browser.` };
     }
     const login = page.getByRole('button', { name: /^(log in|sign in)$/i }).or(page.getByRole('link', { name: /^(log in|sign in)$/i }));
     if (/\/auth\//.test(page.url()) || await login.first().isVisible().catch(() => false)) {
-      return { status: 'login_required', message: 'Session is not signed in. Import fresh cookies or run npm run login.' };
+      return { status: 'login_required', message: `Session is not signed in. Run ${cli('manage-accounts')}, select this account and sign in again.` };
     }
     if (await page.locator(this.config.selectors.composer).filter({ visible: true }).first().isVisible().catch(() => false)) {
       return { status: 'ready', message: 'ChatGPT is ready to receive image requests. Account access and image usage limits still apply.' };
     }
     return { status: 'unavailable', message: 'ChatGPT opened, but its message box was not found. Image generation is unavailable until the page finishes loading or the browser adapter is updated.' };
+  }
+
+  /**
+   * Wait while the user signs in through the visible browser. Never navigates
+   * away from their sign-in pages; returns once ChatGPT shows a signed-in composer.
+   */
+  async waitForSignIn(options: { timeoutMs?: number; pollMs?: number; signal?: AbortSignal; onStatus?: (status: SessionStatus['status']) => void } = {}): Promise<SessionStatus> {
+    const page = await this.open();
+    const origin = new URL(this.baseUrl).origin;
+    const deadline = Date.now() + (options.timeoutMs ?? 15 * 60_000);
+    let last: SessionStatus['status'] | undefined;
+    let readySince = 0;
+    while (Date.now() < deadline) {
+      if (options.signal?.aborted) return { status: 'login_required', message: 'Sign-in cancelled. Nothing was changed.' };
+      if (page.isClosed()) throw new BrowserError('The Chrome window was closed before sign-in finished.');
+      let state: SessionStatus['status'] = 'login_required';
+      let onChatGPT = false;
+      try { onChatGPT = new URL(page.url()).origin === origin; } catch { /* Navigation in progress. */ }
+      if (onChatGPT) {
+        state = (await this.inspect(page)).status;
+        if (state === 'ready' && !hasSessionCookies(await this.context!.cookies())) state = 'login_required';
+      }
+      if (state !== last) { last = state; options.onStatus?.(state); }
+      // Require two consecutive signed-in checks so a redirect cannot end sign-in early.
+      if (state === 'ready') {
+        if (readySince) return { status: 'ready', message: 'ChatGPT is ready to receive image requests. Account access and image usage limits still apply.' };
+        readySince = Date.now();
+      } else readySince = 0;
+      await delay(options.pollMs ?? 1500, undefined, { signal: options.signal }).catch(() => {});
+    }
+    return { status: 'login_required', message: 'Timed out waiting for sign-in. Nothing was changed.' };
+  }
+
+  /** Email and plan of the signed-in account; the session token never leaves the page. */
+  async accountProfile(): Promise<{ email?: string; plan?: string } | undefined> {
+    const page = this.page;
+    if (!page || page.isClosed()) return undefined;
+    try {
+      const profile = await page.evaluate(async () => {
+        const response = await fetch('/api/auth/session', { credentials: 'include' });
+        if (!response.ok) return undefined;
+        const session = await response.json() as { user?: { email?: unknown }; account?: { planType?: unknown } };
+        return { email: session.user?.email, plan: session.account?.planType };
+      });
+      const email = typeof profile?.email === 'string' && /^[^\s@\x00-\x1f]{1,64}@[^\s@\x00-\x1f]{1,190}$/.test(profile.email) ? profile.email : undefined;
+      const plan = typeof profile?.plan === 'string' && /^[a-z0-9_-]{1,32}$/i.test(profile.plan) ? profile.plan.toLowerCase() : undefined;
+      return email || plan ? { ...(email ? { email } : {}), ...(plan ? { plan } : {}) } : undefined;
+    } catch { return undefined; }
   }
 
   async sessionStatus(navigate = true, settleMs = 0): Promise<SessionStatus> {
@@ -209,7 +258,7 @@ export class ChatGPTBrowser {
     }
     catch (error) {
       if (error instanceof BrowserError) throw error;
-      throw new BrowserError('Browser interaction failed. Inspect the page with npm run login and check the selector overrides. Check the conversation before submitting again.');
+      throw new BrowserError(`Browser interaction failed. Inspect the page with ${cli('login')} and check the selector overrides. Check the conversation before submitting again.`);
     }
   }
 

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { loadConfig, projectRoot } from './config.js';
+import { loadConfig, cli, launchCommand } from './config.js';
 import { acquireRuntime } from './runtime.js';
 import { ChatGPTBrowser } from './browser.js';
 import { JobStore } from './store.js';
@@ -19,6 +19,8 @@ import { manageAccounts } from './account-menu.js';
 const help = `ChatGPT Images MCP (local browser, no OpenAI API)
 
 Commands:
+  init                      Guided setup: check requirements, add an account, connect Claude Code and Codex
+  doctor                    Check Chrome, accounts, the background server and client connections
   serve                     Connect stdio to the shared local MCP worker (default)
   browser                   Open/reuse dedicated Chrome in CDP mode, then disconnect
   browser-manual            Open ordinary Chrome for manual challenge diagnostics
@@ -53,22 +55,47 @@ async function main(): Promise<void> {
   }, allowPositionals: true });
   if (values.help) { console.log(help); return; }
   const command = positionals[0] ?? 'serve';
-  if (positionals.length > 1 || !['serve', 'worker', 'browser', 'browser-manual', 'browser-close', 'setup', 'paste-cookies', 'login', 'import-cookies', 'status', 'generate', 'recover', 'config', 'accounts', 'manage-accounts', 'account-add', 'account-use'].includes(command)) throw new Error(help);
+  if (positionals.length > 1 || !['init', 'doctor', 'serve', 'worker', 'browser', 'browser-manual', 'browser-close', 'setup', 'paste-cookies', 'login', 'import-cookies', 'status', 'generate', 'recover', 'config', 'accounts', 'manage-accounts', 'account-add', 'account-use'].includes(command)) throw new Error(help);
   const baseConfig = loadConfig();
   const registry = new AccountRegistry(baseConfig);
   if (['account-add', 'account-use'].includes(command)) {
     if (!values.account) throw new Error(`Usage: ${command} --account NAME`);
     if (command === 'account-add') {
       await registry.add(values.account);
-      console.log(JSON.stringify({ account: values.account, status: 'login_required', message: `Run npm run setup -- --account ${values.account} to sign in or paste cookies in the terminal. The server can then select it automatically.` }, null, 2));
+      console.log(JSON.stringify({ account: values.account, status: 'login_required', message: `Run ${cli(`setup --account ${values.account}`)} to sign in or paste cookies in the terminal. The server can then select it automatically.` }, null, 2));
     } else { await registry.select(values.account); console.log(JSON.stringify({ account: values.account, selection_mode: 'manual' }, null, 2)); }
+    return;
+  }
+  if (command === 'doctor') {
+    if (values.account) throw new Error('doctor checks every account; it does not take --account.');
+    const { runDoctor, formatChecks } = await import('./doctor.js');
+    const checks = await runDoctor(baseConfig, registry);
+    console.log(formatChecks(checks));
+    if (checks.some(check => check.status === 'fail')) process.exitCode = 1;
+    return;
+  }
+  if (command === 'init') {
+    if (!process.stdin.isTTY) throw new Error(`Run ${cli('init')} in an interactive terminal.`);
+    if (values.account) throw new Error('init asks for account names interactively.');
+    const prompts = await import('@clack/prompts');
+    const { terminalIO, defaultActions } = await import('./account-menu.js');
+    const { runInit } = await import('./init.js');
+    const { systemEnvironment } = await import('./clients.js');
+    prompts.intro('ChatGPT Images · setup', { output: process.stderr });
+    const done = await runInit(baseConfig, registry, { io: terminalIO, actions: defaultActions(registry, terminalIO), environment: systemEnvironment,
+      manageAccounts: () => manageAccounts(registry) });
+    prompts.outro(done ? 'Setup complete.' : `Not finished yet. Run ${cli('doctor')} to see what's left.`, { output: process.stderr });
+    if (!done) process.exitCode = 1;
     return;
   }
   if (command === 'accounts') { console.log(JSON.stringify(await registry.list(), null, 2)); return; }
   if (command === 'manage-accounts') {
-    if (!process.stdin.isTTY) throw new Error('Run npm run accounts:manage in an interactive terminal.');
+    if (!process.stdin.isTTY) throw new Error(`Run ${cli('manage-accounts')} in an interactive terminal.`);
     if (values.account) throw new Error('Choose an account inside the interactive menu.');
+    const prompts = await import('@clack/prompts');
+    prompts.intro('ChatGPT Images · accounts', { output: process.stderr });
     await manageAccounts(registry);
+    prompts.outro('Changes are saved. Running MCP servers pick them up for new requests.', { output: process.stderr });
     return;
   }
   const sharedCommand = ['serve', 'worker', 'config'].includes(command);
@@ -77,7 +104,7 @@ async function main(): Promise<void> {
   const account = sharedCommand ? 'default' : values.account ?? (command === 'recover' ? await registry.owner(values.job!) : await registry.active());
   const config = sharedCommand ? baseConfig : await registry.require(account);
   if (command === 'config') {
-    console.log(JSON.stringify({ mcpServers: { 'chatgpt-images': { command: process.execPath, args: [path.join(projectRoot, 'dist/index.js'), 'serve'], env: { CHATGPT_DATA_DIR: config.dataDir } } } }, null, 2));
+    console.log(JSON.stringify({ mcpServers: { 'chatgpt-images': { ...launchCommand(), env: { CHATGPT_DATA_DIR: config.dataDir } } } }, null, 2));
     return;
   }
   if (command === 'import-cookies' && !values.file) throw new Error('Usage: import-cookies --file /absolute/path/to/cookies.json');

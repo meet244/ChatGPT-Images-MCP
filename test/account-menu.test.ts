@@ -5,57 +5,106 @@ import { mkdtemp, readFile, rm, stat, writeFile, mkdir } from 'node:fs/promises'
 import os from 'node:os';
 import path from 'node:path';
 import { AccountRegistry } from '../src/accounts.js';
-import { manageAccounts } from '../src/account-menu.js';
+import { manageAccounts, type AccountMenuActions, type AccountMenuIO, type MenuChoice } from '../src/account-menu.js';
+import { accountOverview, describeStatus } from '../src/account-overview.js';
 import { loadConfig } from '../src/config.js';
 import { saveCookies } from '../src/session-store.js';
 import { JobStore } from '../src/store.js';
 import { acquireRuntime } from '../src/runtime.js';
 
-test('fresh installations and empty worker databases have no implicit default account', async () => {
+const CANCEL = Symbol('cancel');
+type Step = string | typeof CANCEL | ((choices: MenuChoice<string>[]) => string);
+/** Scripted terminal: each select/text prompt consumes the next step and fails on unexpected prompts. */
+function scripted(steps: Step[]) {
+  const printed: string[] = [], menus: { message: string; choices: MenuChoice<string>[]; initial?: string }[] = [], rejected: string[] = [];
+  const next = (message: string): Step => {
+    assert.ok(steps.length, `Unexpected prompt: ${message}`);
+    return steps.shift()!;
+  };
+  const io: AccountMenuIO = {
+    async select(message, choices, initial) {
+      menus.push({ message, choices, ...(initial !== undefined ? { initial } : {}) });
+      const step = next(message);
+      if (step === CANCEL) return undefined;
+      const value = typeof step === 'function' ? step(choices) : step;
+      assert.ok(choices.some(choice => choice.value === value), `'${value}' is not offered by "${message}": ${choices.map(choice => choice.value).join(', ')}`);
+      return value as never;
+    },
+    async text(message, options = {}) {
+      let step = next(message);
+      // Record validation failures, then continue with the following step as the corrected answer.
+      while (typeof step === 'string' && options.validate?.(step)) { rejected.push(options.validate(step)!); step = next(message); }
+      if (step === CANCEL) return undefined;
+      return step as string;
+    },
+    print(message) { printed.push(message); },
+  };
+  const actions = { calls: [] as string[] } as AccountMenuActions & { calls: string[] };
+  for (const name of ['signIn', 'pasteCookies', 'closeBrowser', 'prepare'] as const) actions[name] = async (account: string) => { actions.calls.push(`${name}:${account}`); };
+  return { io, actions, printed, menus, rejected, done: () => assert.deepEqual(steps, [], 'Every scripted answer is used') };
+}
+const mainMenu = (menus: { message: string; choices: MenuChoice<string>[] }[]) => menus.filter(menu => menu.message.startsWith('ChatGPT accounts')).at(-1)!;
+
+test('fresh installations start empty and the menu offers adding an account first', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-empty-accounts-'));
   const registry = new AccountRegistry(loadConfig({ CHATGPT_DATA_DIR: dir }));
   try {
     const store = new JobStore(dir); store.close();
     assert.deepEqual(await registry.names(), []);
     assert.equal(await registry.active(), undefined);
-    assert.deepEqual((await registry.list()).accounts, []);
     assert.equal((await registry.list()).active_account, null);
     await assert.rejects(registry.require('default'), /Unknown account/);
-    const answers = ['2', '0'], messages: string[] = [];
-    await manageAccounts(registry, { question: async () => answers.shift()!, print: message => messages.push(message) });
-    assert.match(messages.join('\n'), /No accounts configured/);
-    assert.match(messages.join('\n'), /8\) Delete an account/);
-    await registry.add('personal');
-    assert.deepEqual(await registry.names(), ['personal']);
-    assert.equal(await registry.active(), 'personal');
+    const terminal = scripted([CANCEL]);
+    await manageAccounts(registry, terminal.io, terminal.actions);
+    terminal.done();
+    assert.match(terminal.printed.join('\n'), /No accounts yet/);
+    const menu = mainMenu(terminal.menus);
+    assert.deepEqual(menu.choices.map(choice => choice.value), ['add', 'exit']);
+    assert.equal(terminal.menus[0]!.initial, 'add');
+    assert.deepEqual(terminal.actions.calls, []);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test('the delete menu cancels without changes and deletes the selected last account after confirmation', async () => {
+test('adding an account validates its name, then signs in with Chrome by default or with cookies on request', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'images-add-menu-'));
+  const registry = new AccountRegistry(loadConfig({ CHATGPT_DATA_DIR: dir }));
+  try {
+    const terminal = scripted(['add', 'Bad Name', 'main', 'browser', 'add', 'main', 'work', 'cookies', 'add', 'spare', 'later', 'exit']);
+    await manageAccounts(registry, terminal.io, terminal.actions);
+    terminal.done();
+    assert.deepEqual(terminal.rejected, ['Use lowercase letters, digits, - or _, starting with a letter (max 48).', 'An account with this name already exists.']);
+    // The session lock is prepared before every browser or cookie action.
+    assert.deepEqual(terminal.actions.calls, ['prepare:main', 'signIn:main', 'prepare:work', 'pasteCookies:work']);
+    assert.deepEqual(await registry.names(), ['main', 'spare', 'work']);
+    const methods = terminal.menus.find(menu => menu.message === 'How do you want to sign in?')!;
+    assert.equal(methods.initial, 'browser');
+    assert.match(terminal.printed.join('\n'), /Added spare/);
+    // Newest accounts get the highest priority, so they appear first.
+    assert.deepEqual(mainMenu(terminal.menus).choices.map(choice => choice.value), ['account:spare', 'account:work', 'account:main', 'add', 'exit']);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('the delete action asks for the profile ID, frees its lock first, and keeps the account on a wrong answer', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-delete-menu-'));
   const registry = new AccountRegistry(loadConfig({ CHATGPT_DATA_DIR: dir }));
   const config = await registry.add('work');
   await writeFile(path.join(config.dataDir, 'session-cookies.json'), '[]');
   await registry.select('work');
   try {
-    for (const confirm of ['', 'wrong']) {
-      const answers = ['8', '1', confirm, '0'];
-      await manageAccounts(registry, { question: async () => answers.shift()!, print: () => {} });
-      assert.deepEqual(await registry.names(), ['work']);
-      assert.equal(await registry.active(), 'work');
-    }
-    const answers = ['8', '1', 'work', '0'], messages: string[] = [];
-    await manageAccounts(registry, { question: async () => answers.shift()!, print: message => messages.push(message) });
-    assert.match(messages.join('\n'), /Deleted work/);
+    const cancelled = scripted(['account:work', 'delete', 'wrong', 'exit']);
+    await manageAccounts(registry, cancelled.io, cancelled.actions);
+    cancelled.done();
+    assert.deepEqual(await registry.names(), ['work']);
+    assert.match(cancelled.printed.join('\n'), /Nothing was deleted/);
+    assert.deepEqual(cancelled.actions.calls, []);
+    const confirmed = scripted(['account:work', 'delete', 'work', 'exit']);
+    await manageAccounts(registry, confirmed.io, confirmed.actions);
+    confirmed.done();
+    assert.deepEqual(confirmed.actions.calls, ['prepare:work']);
     const listing = await new AccountRegistry(registry.baseConfig).list();
     assert.deepEqual(listing.accounts, []);
-    assert.equal(listing.active_account, null);
     assert.equal(listing.selection_mode, 'priority');
-    assert.equal(listing.manual_account, undefined);
     await assert.rejects(stat(config.dataDir), { code: 'ENOENT' });
-    await registry.add('work');
-    assert.deepEqual(await registry.names(), ['work']);
-    assert.equal((await registry.list()).accounts[0]!.has_saved_session, false);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -105,26 +154,95 @@ test('deleting a legacy default account retains shared settings and other accoun
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test('interactive menu adds, renames, prioritizes and selects profiles, then restores automatic order', async () => {
+test('account actions rename, reorder with move up/down, pin an account first, and restore automatic order', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-account-menu-'));
   const registry = new AccountRegistry(loadConfig({ CHATGPT_DATA_DIR: dir }));
-  const answers = ['9', '1', 'work', '3', '1', 'Work images', '4', 'work', '102', '5', 'work', '6', '2', '1', '0'];
-  const messages: string[] = [], pasted: string[] = [];
+  await registry.add('first');
+  await registry.add('second');
+  await registry.add('third');
   try {
-    await manageAccounts(registry, {
-      question: async () => { assert.ok(answers.length); return answers.shift()!; },
-      print: message => messages.push(message),
-    }, async account => { pasted.push(account); });
-    assert.deepEqual(pasted, ['work', 'work']);
+    assert.deepEqual(await registry.orderedNames(), ['third', 'second', 'first']);
+    const terminal = scripted([
+      'account:first', 'rename', 'Work images',
+      'account:first', 'up',
+      'account:first', 'up',
+      'account:first', (choices) => { assert.equal(choices.some(choice => choice.value === 'up'), false, 'The top account cannot move up'); return 'down'; },
+      'account:third', 'pin',
+      'automatic',
+      'account:second', 'close',
+      'account:second', 'signin',
+      'exit',
+    ]);
+    await manageAccounts(registry, terminal.io, terminal.actions);
+    terminal.done();
     const saved = await new AccountRegistry(registry.baseConfig).list();
     assert.equal(saved.selection_mode, 'priority');
-    assert.equal(saved.accounts[0]?.account, 'work');
-    assert.equal(saved.accounts[0]?.display_name, 'Work images');
-    assert.equal(saved.accounts[0]?.priority, 102);
-    assert.match(messages.join('\n'), /Choose an option/);
-    assert.match(messages.join('\n'), /manual selection \(work\)/);
-    assert.match(messages.join('\n'), /Automatic priority order enabled/);
+    assert.deepEqual(saved.accounts.map(account => account.account), ['third', 'first', 'second']);
+    assert.equal(saved.accounts[1]?.display_name, 'Work images');
+    assert.deepEqual(saved.accounts.map(account => account.priority), [3, 2, 1]);
+    assert.deepEqual(terminal.actions.calls, ['prepare:second', 'closeBrowser:second', 'prepare:second', 'signIn:second']);
+    const messages = terminal.menus.map(menu => menu.message);
+    assert.ok(messages.some(message => /third is always used first/.test(message)));
+    assert.match(terminal.printed.join('\n'), /Automatic order restored/);
+    // New accounts still go to the top after renumbering.
+    await registry.add('fourth');
+    assert.equal((await registry.orderedNames())[0], 'fourth');
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('the account list shows email, plan, session expiry, cooldowns, images per generating profile and last use', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'images-account-overview-'));
+  const registry = new AccountRegistry(loadConfig({ CHATGPT_DATA_DIR: dir }));
+  const now = Date.now();
+  const cookie = (expires: number) => [{ name: '__Secure-next-auth.session-token.0', value: 'a', domain: '.chatgpt.com', path: '/', expires, httpOnly: true, secure: true, sameSite: 'Lax' as const },
+    { name: '__Secure-next-auth.session-token.1', value: 'b', domain: '.chatgpt.com', path: '/', expires: expires + 1000, httpOnly: true, secure: true, sameSite: 'Lax' as const }];
+  const work = await registry.add('work'), spare = await registry.add('spare'), empty = await registry.add('empty');
+  await saveCookies(work.dataDir, cookie(Math.floor((now + 30 * 86_400_000) / 1000)));
+  await saveCookies(spare.dataDir, cookie(Math.floor((now + 2 * 86_400_000) / 1000)));
+  await saveCookies(path.join(dir, 'accounts', 'expired'), cookie(Math.floor((now - 86_400_000) / 1000)));
+  await registry.setProfile('work', { email: 'person@example.com', plan: 'plus' });
+  await assert.rejects(registry.setProfile('work', { email: 'not an email' }), /could not be saved/);
+  // work generated two images for its own job and one for spare's job after failover.
+  const workStore = new JobStore(work.dataDir);
+  const own = workStore.create('own');
+  workStore.update(own.id, { status: 'completed', images: [{ path: '/a.png', mimeType: 'image/png', bytes: 1 }, { path: '/b.png', mimeType: 'image/png', bytes: 1 }] });
+  workStore.close();
+  const spareStore = new JobStore(spare.dataDir);
+  const moved = spareStore.create('moved');
+  spareStore.update(moved.id, { status: 'completed', executionAccount: 'work', images: [{ path: '/c.png', mimeType: 'image/png', bytes: 1 }] });
+  spareStore.recordImageLimit('image_usage_limit', 'Limit reached.');
+  spareStore.close();
+  let held: (() => Promise<void>) | undefined = await acquireRuntime(empty);
+  try {
+    const overview = await accountOverview(registry, now);
+    const byName = Object.fromEntries(overview.accounts.map(account => [account.account, account]));
+    assert.equal(byName.work!.name, 'person@example.com');
+    assert.equal(byName.work!.plan, 'plus');
+    assert.equal(byName.work!.images, 3);
+    assert.ok(byName.work!.lastUsed);
+    assert.equal(byName.spare!.images, 0);
+    assert.ok(byName.spare!.cooldownUntil);
+    assert.equal(byName.empty!.session, 'missing');
+    assert.equal(byName.empty!.inUse, true);
+    assert.equal(byName.work!.inUse, false);
+    assert.equal(describeStatus(byName.work!, now).text, 'ready · expires in 30 days · 3 images · used just now');
+    assert.equal(describeStatus(byName.work!, now).tone, 'good');
+    assert.match(describeStatus(byName.spare!, now).text, /^image limit · available /);
+    assert.equal(describeStatus(byName.empty!, now).text, 'needs sign-in');
+    assert.equal(byName.expired!.session, 'expired');
+    assert.equal(describeStatus(byName.expired!, now).text, 'session expired · sign in again');
+    assert.equal(describeStatus(byName.spare!, now).tone, 'warn');
+    const terminal = scripted(['exit']);
+    await manageAccounts(registry, terminal.io, terminal.actions);
+    const labels = mainMenu(terminal.menus).choices.map(choice => choice.label).join('\n');
+    assert.match(labels, /person@example\.com.*Plus · --account work/);
+    assert.match(labels, /in use by MCP server/);
+    // Account details stay out of MCP list_accounts output.
+    assert.doesNotMatch(JSON.stringify(await registry.list()), /person@example|plus/);
+    await rm(path.join(dir, 'accounts', 'expired'), { recursive: true });
+    await writeFile(path.join(dir, 'account-settings.json'), JSON.stringify({ version: 1, mode: 'priority', accounts: { work: { email: 'bad email' } } }));
+    await assert.rejects(registry.list(), /Account settings could not be read/);
+  } finally { await held?.(); held = undefined; await rm(dir, { recursive: true, force: true }); }
 });
 
 test('renaming preserves credential files and job ownership; concurrent settings updates persist privately', async () => {

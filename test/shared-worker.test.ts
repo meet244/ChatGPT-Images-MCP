@@ -13,7 +13,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { loadConfig, projectRoot } from '../src/config.js';
 import { ChatGPTBrowser } from '../src/browser.js';
 import { JobStore } from '../src/store.js';
-import { startSharedWorker } from '../src/shared-worker.js';
+import { startSharedWorker, requestAccountRelease } from '../src/shared-worker.js';
+import { defaultActions } from '../src/account-menu.js';
+import { acquireRuntime } from '../src/runtime.js';
 import { AccountRegistry } from '../src/accounts.js';
 
 const names = ['add_account', 'cancel_job', 'generate_image', 'generate_images', 'get_batch_status', 'get_image', 'get_job_status', 'list_accounts', 'list_jobs', 'session_status', 'wait_for_job'];
@@ -174,4 +176,63 @@ test('worker refuses unauthenticated local connections without exposing MCP mess
     await new Promise<void>(resolve => socket.once('close', () => resolve()));
     assert.equal(response, '');
   } finally { await worker.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a running worker frees an idle account for terminal repair, refuses during generation, and reopens it for new jobs', { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'images-worker-release-'));
+  const config = loadConfig({ CHATGPT_DATA_DIR: dir });
+  const registry = new AccountRegistry(config);
+  const generated: string[] = [];
+  let openGate!: () => void, started = false;
+  const gate = new Promise<void>(resolve => { openGate = resolve; });
+  const worker = await startSharedWorker(config, { browserFactory: (config, account) => {
+    const browser = new ChatGPTBrowser(config);
+    browser.generate = async (_id, prompt) => {
+      generated.push(`${account}:${prompt}`);
+      if (prompt === 'slow') { started = true; await gate; }
+      return { images: [], conversationUrl: 'https://chatgpt.com/c/fixture' };
+    };
+    return browser;
+  } });
+  const connection = clientFor(dir);
+  const held = async (account: string) => lockfile.check((await registry.require(account)).dataDir, { stale: 30_000 });
+  try {
+    await connection.client.connect(connection.transport);
+    const call = (name: string, args: object = {}) => connection.client.callTool({ name, arguments: args });
+    const complete = async (prompt: string) => {
+      const job = parsed(await call('generate_image', { prompt }));
+      await until(async () => parsed(await call('get_job_status', { job_id: job.id })).status === 'completed');
+    };
+    await call('add_account', { account: 'work' });
+    await complete('first');
+    assert.equal(await held('work'), true, 'The worker holds the account it generated with');
+    let result = '';
+    await until(async () => (result = await requestAccountRelease(config, 'work')) !== 'busy');
+    assert.equal(result, 'released');
+    assert.equal(await held('work'), false);
+    // A terminal command can now take the lock, exactly as when no worker was running.
+    const release = await acquireRuntime(await registry.require('work'));
+    await release();
+    await complete('second');
+    assert.deepEqual(generated, ['work:first', 'work:second'], 'The next request reopens the released account');
+
+    const slow = parsed(await call('generate_image', { prompt: 'slow' }));
+    await until(() => started);
+    assert.equal(await requestAccountRelease(config, 'work'), 'busy');
+    assert.equal(await held('work'), true, 'An account is never freed during generation');
+    const actions = defaultActions(registry, { select: async () => undefined, text: async () => undefined, print: () => {} });
+    await assert.rejects(actions.prepare('work'), /generating images right now/);
+    openGate();
+    await until(async () => parsed(await call('get_job_status', { job_id: slow.id })).status === 'completed');
+
+    assert.equal(await requestAccountRelease(config, 'default'), 'unsupported');
+    await registry.add('spare');
+    assert.equal(await requestAccountRelease(config, 'spare'), 'not_open');
+    await until(async () => { try { await actions.prepare('work'); return true; } catch { return false; } });
+    assert.equal(await held('work'), false, 'The menu frees an idle account before using it');
+    await assert.rejects(requestAccountRelease(config, '../escape'), /Invalid account name/);
+  } finally { openGate(); await connection.client.close(); await worker.close(); }
+  try {
+    assert.equal(await requestAccountRelease(config, 'work'), 'no_worker');
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

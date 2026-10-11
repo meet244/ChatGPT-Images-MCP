@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline/promises';
 import { createInterface as createLineReader } from 'node:readline';
 import type { ReadStream } from 'node:tty';
+import { cli } from './config.js';
 
 export async function question(prompt: string): Promise<string> {
   const reader = createInterface({ input: process.stdin, output: process.stderr, historySize: 0 });
@@ -10,7 +11,7 @@ export async function question(prompt: string): Promise<string> {
 
 /** Ask for the two split session-cookie values, with visible input. */
 export async function readCookieInput(input: ReadStream = process.stdin, output: NodeJS.WritableStream = process.stderr): Promise<string> {
-  if (!input.isTTY) throw new Error('Cookie pasting requires an interactive terminal. Run npm run setup in a terminal.');
+  if (!input.isTTY) throw new Error(`Cookie pasting requires an interactive terminal. Run ${cli('setup')} in a terminal.`);
   output.write('Paste only the value for each cookie below, then press Enter. Input is visible. Ctrl+C cancels.\n');
   const names = ['__Secure-next-auth.session-token.0', '__Secure-next-auth.session-token.1'];
   const values: string[] = [];

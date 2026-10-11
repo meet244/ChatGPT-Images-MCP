@@ -6,21 +6,21 @@ import { createConnection, createServer as createNetServer, type Socket } from '
 import { setTimeout as delay } from 'node:timers/promises';
 import lockfile from 'proper-lockfile';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
-import { type Config, projectRoot } from './config.js';
+import { type Config, projectRoot, cli } from './config.js';
 import { acquireRuntime } from './runtime.js';
 import { ChatGPTBrowser } from './browser.js';
 import { JobStore } from './store.js';
 import { JobQueue } from './queue.js';
 import { createServer } from './server.js';
 import { setupSession } from './setup.js';
-import { AccountRegistry, AccountManager, type AccountBrowserFactory } from './accounts.js';
+import { AccountRegistry, AccountManager, accountNamePattern, type AccountBrowserFactory } from './accounts.js';
 
 interface WorkerEndpoint { version: 1; port: number; token: string; pid: number; }
 const endpointFile = (config: Config): string => path.join(config.dataDir, 'worker.json');
 const greeting = 'CHATGPT_IMAGES_WORKER_1';
 
 /** Private handshake precedes the unchanged MCP JSON-line stream. */
-async function readLine(socket: Socket): Promise<string> {
+async function readLine(socket: Socket, timeoutMs = 3000): Promise<string> {
   return new Promise((resolve, reject) => {
     let buffer = Buffer.alloc(0);
     const cleanup = (): void => {
@@ -40,7 +40,7 @@ async function readLine(socket: Socket): Promise<string> {
       if (buffer.length > newline + 1) socket.unshift(buffer.subarray(newline + 1));
       resolve(buffer.subarray(0, newline).toString('utf8'));
     };
-    const timer = setTimeout(fail, 3000);
+    const timer = setTimeout(fail, timeoutMs);
     socket.on('data', onData); socket.once('error', onError); socket.once('close', onClose);
     socket.resume();
   });
@@ -89,6 +89,26 @@ async function connectWorker(config: Config): Promise<Socket> {
   throw new Error('Could not connect to the shared MCP worker. Stop any older server or active login/setup command, then reconnect your MCP client. Saved cookies and jobs are retained; worker diagnostics are in .chatgpt-images/worker.log.');
 }
 
+export type AccountReleaseResult = 'released' | 'not_open' | 'busy' | 'unsupported' | 'error' | 'no_worker';
+
+/** Ask a running worker to free one idle account so a terminal command can repair its session. */
+export async function requestAccountRelease(config: Config, account: string): Promise<AccountReleaseResult> {
+  if (!accountNamePattern.test(account)) throw new Error('Invalid account name.');
+  let socket: Socket | undefined;
+  try {
+    const endpoint = JSON.parse(await readFile(endpointFile(config), 'utf8')) as WorkerEndpoint;
+    if (endpoint.version !== 1 || !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535 || !/^[a-f0-9]{64}$/.test(endpoint.token)) return 'no_worker';
+    socket = createConnection({ host: '127.0.0.1', port: endpoint.port });
+    socket.on('error', () => {});
+    // Closing an idle browser can take several seconds.
+    const reply = readLine(socket, 30_000);
+    socket.write(`${endpoint.token} release ${account}\n`);
+    const result = await reply;
+    return ['released', 'not_open', 'busy', 'unsupported'].includes(result) ? result as AccountReleaseResult : 'error';
+  } catch { return 'no_worker'; }
+  finally { socket?.destroy(); }
+}
+
 export interface SharedWorkerHandle { close(): Promise<void>; done: Promise<void>; }
 
 /** One queue/browser; each authenticated local connection gets its own MCP session. */
@@ -118,8 +138,15 @@ export async function startSharedWorker(config: Config, options: { browser?: Cha
       scheduleIdle();
     });
     void (async () => {
-      const provided = await readLine(socket);
+      const [provided = '', request, account] = (await readLine(socket)).split(' ');
       if (closing || provided.length !== token.length || !timingSafeEqual(Buffer.from(provided), Buffer.from(token))) throw new Error('Invalid worker handshake.');
+      // Terminal account repair: one reply line, then close. MCP connections send only the token.
+      if (request !== undefined) {
+        if (request !== 'release' || !account || !accountNamePattern.test(account)) throw new Error('Invalid worker request.');
+        const result = await accounts.release(account).catch(() => 'error');
+        socket.end(`${result}\n`);
+        return;
+      }
       if (timer) clearTimeout(timer);
       const server = createServer(store, queue, browser, accounts);
       connections.set(socket, server);
@@ -182,7 +209,7 @@ export async function runSharedStdio(config: Config): Promise<void> {
   const selected = account ? await registry.require(account) : undefined;
   // Preserve interactive setup, but never acquire the worker's runtime lock merely
   // to establish a second MCP connection. Protocol clients never get terminal prompts.
-  if (!selected) console.error('No accounts configured. Run npm run accounts:manage to add one.');
+  if (!selected) console.error(`No accounts configured. Run ${cli('manage-accounts')} to add one.`);
   else if (process.stdin.isTTY && !await lockfile.check(selected.dataDir, { stale: 30_000 })) {
     const release = await acquireRuntime(selected);
     const browser = new ChatGPTBrowser(selected);
@@ -194,7 +221,7 @@ export async function runSharedStdio(config: Config): Promise<void> {
     const browser = new ChatGPTBrowser(selected);
     console.error(await browser.hasSavedSession()
       ? 'Saved ChatGPT session token found. Use session_status to check whether it is still valid.'
-      : `No saved ChatGPT session token for the selected account. Run npm run setup -- --account ${await registry.active()} in a terminal: 1) Log in / open browser, or 2) Paste cookies.`);
+      : `No saved ChatGPT session token for the selected account. Run ${cli('manage-accounts')} in a terminal and sign in to '${await registry.active()}'.`);
   }
   const socket = await connectWorker(config);
   const stop = (): void => { socket.destroy(); };

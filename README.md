@@ -11,65 +11,46 @@ This is a local [MCP](https://modelcontextprotocol.io) server. When your coding 
 
 ## Requirements
 
-- [Node.js](https://nodejs.org/en/download) **22 or newer** (includes `npm` and `npx`)
+- [Node.js](https://nodejs.org/en/download) **22 or newer** (includes `npx`)
 - [Google Chrome](https://www.google.com/chrome/)
-- [Git](https://git-scm.com/downloads), which npm uses to download this project from GitHub
 - A ChatGPT account that can generate images
 - [Claude Code](https://code.claude.com/docs/en/setup) and/or [Codex](https://learn.chatgpt.com/docs/cli)
 
-You don't need to clone the repository: `npx` downloads and builds it for you.
-
 ## Quick start
 
-### 1. Add your ChatGPT account
-
 ```sh
-npx -y github:meet244/ChatGPT-Images-MCP manage-accounts
+npx -y chatgpt-images-mcp@latest init
 ```
 
-The first run downloads and builds the project, which takes up to a minute. Then:
+That one command:
 
-1. Choose **`1) Add account and paste cookies`**.
-2. Enter a profile name, such as `main`.
-3. Paste the two session-cookie values when asked. See [Finding your session cookies](#finding-your-session-cookies).
-4. Chrome opens twice, first normally and then under the server's control. If ChatGPT shows a verification check, complete it. Each window closes on its own after about 10 seconds.
-5. Wait until the terminal prints **`ready: ChatGPT is ready to receive image requests…`**, then choose **`0`** to exit.
+1. Checks Node.js and Chrome.
+2. Adds your first ChatGPT account. Press Enter to accept the suggested name, then choose **Sign in with Chrome**. A Chrome window opens on ChatGPT; sign in as usual and complete any verification check. The terminal notices when you're signed in, closes Chrome, and shows **Signed in as you@example.com (Plus)**.
+3. Connects Claude Code and Codex, whichever you have installed. If one already uses a different copy of this server, `init` asks before replacing it.
 
-If it prints `challenge` or `login_required` instead, see [Troubleshooting](#troubleshooting).
-
-### 2. Connect your coding agent
-
-**Claude Code:**
-
-```sh
-claude mcp add --scope user chatgpt-images -- npx -y github:meet244/ChatGPT-Images-MCP
-```
-
-**Codex:**
-
-```sh
-codex mcp add chatgpt-images -- npx -y github:meet244/ChatGPT-Images-MCP
-```
-
-Register the server once. It handles every account you add. Restart any Claude Code or Codex sessions that were already open, then type `/mcp` in the session to confirm that `chatgpt-images` is connected.
-
-### 3. Generate an image
-
-Ask your agent:
+Then restart any open Claude Code or Codex sessions and ask:
 
 > Use chatgpt-images to generate a watercolor image of a fox beneath an oak tree, aspect ratio 1:1, then show me the finished image.
 
 The image is saved on your computer, and the agent gets its file path and a preview.
 
-### Optional: a shorter command
+If Google blocks sign-in in the Chrome window, type `q` and press Enter to cancel. Then run `npx chatgpt-images-mcp manage-accounts`, select the account, and choose **Paste session cookies instead**. See [Finding your session cookies](#finding-your-session-cookies).
 
-The rest of this guide writes terminal commands as `chatgpt-images-mcp <command>`. To make that work, add this alias to your `~/.zshrc` or `~/.bashrc`:
+If anything seems off, run `npx chatgpt-images-mcp doctor`. It checks every part of the setup and prints the command that fixes each problem.
+
+<details>
+<summary>Connecting a client by hand</summary>
+
+`init` runs these for you:
 
 ```sh
-alias chatgpt-images-mcp='npx -y github:meet244/ChatGPT-Images-MCP'
+claude mcp add --scope user chatgpt-images -- npx -y chatgpt-images-mcp@latest
+codex mcp add chatgpt-images -- npx -y chatgpt-images-mcp@latest
 ```
 
-Without the alias, type `npx -y github:meet244/ChatGPT-Images-MCP` in place of `chatgpt-images-mcp`.
+Register the server once; it handles every account you add.
+
+</details>
 
 ## Finding your session cookies
 
@@ -132,15 +113,31 @@ If an account runs out of image quota partway through, the finished images are k
 
 ## Multiple accounts and automatic switching
 
-Add as many ChatGPT accounts as you like. Each one has its own cookies, Chrome profile, job history, images, and cooldown. Manage them all from one menu:
+Add as many ChatGPT accounts as you like. Each one has its own login, Chrome profile, job history, images, and cooldown. Manage them all from one menu:
 
 ```sh
-chatgpt-images-mcp manage-accounts
+npx chatgpt-images-mcp manage-accounts
 ```
 
-The menu can add an account, replace its cookies, rename it, set its priority, pick one manually, close its Chrome window, or delete it.
+The menu lists every account with its email, plan, and current state:
 
-- **Higher priority numbers run first.** Each new account gets the current highest priority + 1.
+```text
+◆  ChatGPT accounts · the top one is used first; the next takes over at an image limit
+│  ● you@example.com  Plus · --account main
+│      ready · expires in 12 days · 42 images · used 2h ago
+│  ○ work@example.com  Free · --account work
+│      image limit · available Sat 14:30 · 9 images · used 5h ago
+│  ○ spare
+│      session expired · sign in again
+│  ○ + Add an account
+│  ○ Exit
+```
+
+Select an account to sign in again, paste cookies, rename it, move it up or down, always use it first, close its Chrome window, or delete it. The email and plan are filled in automatically after you sign in. They're shown only in this menu, never to your agent.
+
+You can fix an account while Claude Code or Codex is running. If the background server is using that account, the menu asks it to let go first. This only works while no image is generating; otherwise the menu asks you to try again once it finishes.
+
+- **The top account is used first.** New accounts go to the top; use **Move up** and **Move down** to change the order.
 - **Switching is automatic.** When ChatGPT reports an image limit, the server puts that account on a **24-hour cooldown** and continues the same job on the next ready account. Two image-less text replies in a row on the same account also count as a likely limit.
 - **Only definite limits trigger a switch.** Timeouts and unclear failures stop the job instead, so a prompt is never sent twice.
 - **Job IDs stay the same after a switch**, so your agent keeps polling the same ID.
@@ -154,7 +151,7 @@ Inside your agent, `list_accounts` shows your profiles and `add_account` creates
 **Sign in in the browser** instead of pasting cookies:
 
 ```sh
-chatgpt-images-mcp setup --account main
+npx chatgpt-images-mcp setup --account main
 ```
 
 Choose **1) Log in / open browser**, sign in in the Chrome window, then press Enter in the terminal.
@@ -162,7 +159,7 @@ Choose **1) Log in / open browser**, sign in in the Chrome window, then press En
 **Import a JSON cookie export.** This works with an unsplit token or a full export from a cookie extension:
 
 ```sh
-chatgpt-images-mcp import-cookies --account main --file "/absolute/path/to/cookies.json"
+npx chatgpt-images-mcp import-cookies --account main --file "/absolute/path/to/cookies.json"
 ```
 
 The file can be a JSON array of cookies or a Playwright storage-state file.
@@ -176,7 +173,7 @@ CHATGPT_AUTO_SWITCH_ACCOUNTS=true
 CHATGPT_TIMEOUT_MS=300000
 ```
 
-You can also pass settings when you register the server, for example `claude mcp add --scope user -e CHATGPT_TIMEOUT_MS=600000 chatgpt-images -- npx -y github:meet244/ChatGPT-Images-MCP`.
+You can also pass settings when you register the server, for example `claude mcp add --scope user -e CHATGPT_TIMEOUT_MS=600000 chatgpt-images -- npx -y chatgpt-images-mcp@latest`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -216,31 +213,39 @@ The folder is private (`700`) and holds your session secrets, so don't share it 
 
 ## Updating
 
-When you start a new agent session, `npx` checks GitHub and installs the latest version automatically. Your accounts and images are kept, because they live outside the package.
+Nothing to do. The registered command, `npx -y chatgpt-images-mcp@latest`, picks up new releases when your agent starts the server. Your accounts and images are kept, because they live outside the package.
 
-After an update, close **all** Claude Code and Codex sessions so the old background server exits, then open them again.
+After a release, close **all** Claude Code and Codex sessions so the old background server exits, then open them again.
 
-To stay on a fixed version, add a tag or commit to the package name, such as `github:meet244/ChatGPT-Images-MCP#<tag-or-commit>`, everywhere you use it.
+To stay on one version, replace `@latest` with a version number, such as `chatgpt-images-mcp@0.1.0`, in both registrations.
 
 ## Troubleshooting
 
-**"This data directory is in use by another server or login command"**
-A running server, or another setup command, is using that account. Close every Claude Code and Codex session, including IDE extensions, and wait a few seconds for the background server to exit. A server with queued images exits once they finish. Then run your command again. Don't delete lock files or change `CHATGPT_DATA_DIR` to work around this.
-
-**The server doesn't connect, or shows "0 tools"**
-The first launch, and the first launch after an update, has to download and build the project. That can be slower than your agent's startup timeout. Run `chatgpt-images-mcp accounts` once in a terminal to finish the install, then restart your agent. The server needs internet access when it starts because `npx` checks GitHub. Run `claude mcp get chatgpt-images` or `codex mcp list` to check the registration.
-
-**Status is `challenge` (verification keeps appearing)**
-Close your agent sessions, then open the account's profile in normal Chrome and complete the check:
+Start with:
 
 ```sh
-chatgpt-images-mcp browser-manual --account main
+npx chatgpt-images-mcp doctor
 ```
 
-Quit that Chrome window completely, then check again with `chatgpt-images-mcp status --account main`.
+It checks Node.js, Chrome, the data folder, the background server, every account's sign-in state and image limit, and whether Claude Code and Codex use this copy. It prints a fix for each problem. The cases below cover what it can't fix by itself.
+
+**"This data directory is in use by another server or login command"**
+A running server, or another setup command, is using that account. `manage-accounts` frees idle accounts from a running server by itself, so try it there first. Otherwise, close every Claude Code and Codex session, including IDE extensions, and wait a few seconds for the background server to exit. A server with queued images exits once they finish. Then run your command again. Don't delete lock files or change `CHATGPT_DATA_DIR` to work around this.
+
+**The server doesn't connect, or shows "0 tools"**
+The first launch after a new release downloads the package, which can be slower than your agent's startup timeout. Run `npx chatgpt-images-mcp@latest doctor` once in a terminal to finish the download, then restart your agent. `npx` checks npm for new releases when the server starts, so it needs internet access then.
+
+**Status is `challenge` (verification keeps appearing)**
+Run `npx chatgpt-images-mcp manage-accounts`, select the account, choose **Sign in again with Chrome**, and complete the check. If it keeps coming back, close your agent sessions and complete it in normal Chrome instead:
+
+```sh
+npx chatgpt-images-mcp browser-manual --account main
+```
+
+Quit that Chrome window completely, then check again with `npx chatgpt-images-mcp status --account main`.
 
 **Status is `login_required`**
-The session has expired. Paste fresh cookies with `chatgpt-images-mcp manage-accounts`, option **2**.
+The session has expired. Run `npx chatgpt-images-mcp manage-accounts`, select the account, and choose **Sign in again with Chrome**.
 
 **Status is `usage_limit` or `blocked`**
 That account's image limit was reached. It's on a 24-hour cooldown, shown as `retryAfter`. Add another account to keep generating in the meantime.
@@ -249,7 +254,7 @@ That account's image limit was reached. It's on a 24-hour cooldown, shown as `re
 Close your agent sessions, then save the image from the existing conversation without sending a new prompt:
 
 ```sh
-chatgpt-images-mcp recover --job JOB_ID
+npx chatgpt-images-mcp recover --job JOB_ID
 ```
 
 **Codex says "approval policy is never"**
@@ -259,22 +264,24 @@ Codex blocked the tool call. To let this server's tools run without prompting, a
 
 | Command | What it does |
 | --- | --- |
-| `chatgpt-images-mcp manage-accounts` | Interactive menu: add accounts, paste cookies, rename, set priority, select, delete. |
-| `chatgpt-images-mcp accounts` | List accounts as JSON, without opening a browser. |
-| `chatgpt-images-mcp setup --account NAME` | Check the session, then sign in through the browser or paste cookies. |
-| `chatgpt-images-mcp paste-cookies --account NAME` | Paste the `.0` and `.1` cookie values for an existing account. |
-| `chatgpt-images-mcp import-cookies --account NAME --file PATH` | Import a JSON cookie export. |
-| `chatgpt-images-mcp account-add --account NAME` | Create an empty account profile. |
-| `chatgpt-images-mcp account-use --account NAME` | Always prefer this account; undo with menu option 6. |
-| `chatgpt-images-mcp status --account NAME` | Run a live session check in the browser. |
-| `chatgpt-images-mcp generate --prompt "…" [--reference PATH]` | Generate one image directly from the terminal. |
-| `chatgpt-images-mcp recover --job JOB_ID` | Save a finished image from a failed job's conversation. |
-| `chatgpt-images-mcp browser-manual --account NAME` | Open the account's profile in normal Chrome to complete verification. |
-| `chatgpt-images-mcp browser-close --account NAME` | Close the account's dedicated Chrome. |
-| `chatgpt-images-mcp config` | Print an MCP client config with absolute paths. |
-| `chatgpt-images-mcp --help` | Show every command. |
+| `npx chatgpt-images-mcp init` | Guided setup: requirements, first account, and Claude Code and Codex connections. |
+| `npx chatgpt-images-mcp doctor` | Check the whole setup and print a fix for each problem. |
+| `npx chatgpt-images-mcp manage-accounts` | Interactive menu: add and sign in to accounts, see their status, rename, reorder, delete. |
+| `npx chatgpt-images-mcp accounts` | List accounts as JSON, without opening a browser. |
+| `npx chatgpt-images-mcp setup --account NAME` | Check the session, then sign in through the browser or paste cookies. |
+| `npx chatgpt-images-mcp paste-cookies --account NAME` | Paste the `.0` and `.1` cookie values for an existing account. |
+| `npx chatgpt-images-mcp import-cookies --account NAME --file PATH` | Import a JSON cookie export. |
+| `npx chatgpt-images-mcp account-add --account NAME` | Create an empty account profile. |
+| `npx chatgpt-images-mcp account-use --account NAME` | Always use this account first; undo in the menu with **Go back to automatic order**. |
+| `npx chatgpt-images-mcp status --account NAME` | Run a live session check in the browser. |
+| `npx chatgpt-images-mcp generate --prompt "…" [--reference PATH]` | Generate one image directly from the terminal. |
+| `npx chatgpt-images-mcp recover --job JOB_ID` | Save a finished image from a failed job's conversation. |
+| `npx chatgpt-images-mcp browser-manual --account NAME` | Open the account's profile in normal Chrome to complete verification. |
+| `npx chatgpt-images-mcp browser-close --account NAME` | Close the account's dedicated Chrome. |
+| `npx chatgpt-images-mcp config` | Print the MCP client configuration for this copy. |
+| `npx chatgpt-images-mcp --help` | Show every command. |
 
-Commands that use a browser need the account to be free, so close your agent sessions first. Without `--account`, a command uses the currently selected account.
+Commands that use a browser need the account to be free, so close your agent sessions first (`manage-accounts` frees idle accounts by itself). Without `--account`, a command uses the currently selected account. To skip typing `npx`, install the command once with `npm install -g chatgpt-images-mcp`.
 
 ## MCP tools
 
@@ -296,18 +303,18 @@ One background server is shared by every connected agent. Jobs run one at a time
 
 ## Install from source
 
-For development, or if you prefer a fixed local copy:
+For development, or if you prefer a local copy:
 
 ```sh
 git clone https://github.com/meet244/ChatGPT-Images-MCP.git
 cd ChatGPT-Images-MCP
-npm ci      # also builds dist/
-npm link    # makes the chatgpt-images-mcp command available
+npm ci                  # installs and builds dist/
+npm run cli -- init     # adds an account and points Claude Code and Codex at this copy
 ```
 
-Register it with `claude mcp add --scope user chatgpt-images -- chatgpt-images-mcp`, or the same arguments after `codex mcp add`. A source install keeps its settings in the project folder (`.env`, copied from `.env.example`) and its data in `.chatgpt-images/`. To update, run `git pull && npm ci`, then restart your agents.
+From a source checkout, run commands as `npm run cli -- <command>`, or run `npm link` once to get the `chatgpt-images-mcp` command. A source install keeps its settings in the project folder (`.env`, copied from `.env.example`) and its data in `.chatgpt-images/`. After changing code, run `npm run build` and restart your agents.
 
-**Already set up from a clone and moving to `npx`?** Keep your existing accounts by pointing the new install at the old data. Add `CHATGPT_DATA_DIR=/absolute/path/to/ChatGPT-Images-MCP/.chatgpt-images` to `~/.chatgpt-images-mcp/.env`.
+Each copy has its own accounts. `doctor` tells you which copy each client runs, and `init` switches them to the copy you run it from.
 
 ### Development
 
