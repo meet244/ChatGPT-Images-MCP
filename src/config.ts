@@ -53,6 +53,8 @@ export interface Config {
   headless: boolean;
   browserMode: 'cdp' | 'playwright' | 'webkit';
   autoSwitchAccounts: boolean;
+  /** 'background' (default) keeps the dedicated Chrome behind other windows; 'front' activates it before Send. */
+  browserFocus: 'front' | 'background';
   manualCloseMs: number;
   chromeExecutable?: string;
   cookiesFile?: string;
@@ -74,6 +76,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const browserMode = env.CHATGPT_BROWSER_MODE ?? 'cdp';
   const autoSwitchAccounts = env.CHATGPT_AUTO_SWITCH_ACCOUNTS ?? 'true';
   if (!['true', 'false'].includes(autoSwitchAccounts)) throw new Error('CHATGPT_AUTO_SWITCH_ACCOUNTS must be true or false.');
+  const browserFocus = env.CHATGPT_BROWSER_FOCUS ?? 'background';
+  if (browserFocus !== 'front' && browserFocus !== 'background') throw new Error('CHATGPT_BROWSER_FOCUS must be front or background.');
   if (browserMode !== 'cdp' && browserMode !== 'playwright' && browserMode !== 'webkit') throw new Error('CHATGPT_BROWSER_MODE must be cdp, playwright, or webkit.');
   if (browserMode === 'cdp' && headless === 'true') throw new Error('CDP mode uses visible Chrome. Set CHATGPT_HEADLESS=false or use CHATGPT_BROWSER_MODE=playwright.');
   return {
@@ -81,6 +85,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     headless: headless === 'true',
     browserMode,
     autoSwitchAccounts: autoSwitchAccounts === 'true',
+    browserFocus,
     manualCloseMs: integer(env, 'CHATGPT_MANUAL_CLOSE_MS', 10_000, 0, 600_000),
     chromeExecutable: env.CHATGPT_CHROME_EXECUTABLE ? path.resolve(settingsRoot, env.CHATGPT_CHROME_EXECUTABLE) : undefined,
     cookiesFile: env.CHATGPT_COOKIES_FILE ? path.resolve(settingsRoot, env.CHATGPT_COOKIES_FILE) : undefined,

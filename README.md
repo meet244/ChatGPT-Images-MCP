@@ -85,7 +85,7 @@ Your agent handles this automatically. For reference, the tools work like this:
 
 You can simply ask, for example: *"Generate a hero image for the landing page and save it to public/hero.webp."*
 
-An image can take a few minutes; the default timeout is 5 minutes. Keep the dedicated Chrome window open while it works. The server closes it once the queue is empty.
+An image can take a few minutes; the default timeout is 5 minutes. The dedicated Chrome window opens behind your other windows, so it doesn't take focus while you work; leave it open while it generates. The server closes it once the queue is empty.
 
 **Verification checks.** If ChatGPT shows a "verify you are human" page before the prompt is sent, the server first waits up to 10 seconds for it to clear by itself. If it doesn't, the server opens the same account in normal Chrome for 10 seconds (`CHATGPT_MANUAL_CLOSE_MS`), which usually passes the check, then reconnects and tries once more. You may see a second Chrome window appear briefly. If the check appears after the prompt was sent, the job stops instead, so a prompt is never sent twice.
 
@@ -186,6 +186,7 @@ You can also pass settings when you register the server, for example `claude mcp
 | `CHATGPT_TIMEOUT_MS` | `300000` | Longest wait for one image, in milliseconds. |
 | `CHATGPT_MANUAL_CLOSE_MS` | `10000` | How long normal Chrome stays open to pass a verification check, during setup and before a retried image. During setup, `0` waits until you quit Chrome yourself; before an image it means 10 seconds. |
 | `CHATGPT_BROWSER_MODE` | `cdp` | `cdp` uses your installed Chrome. Alternatives are `playwright` and `webkit` (see below). |
+| `CHATGPT_BROWSER_FOCUS` | `background` | The dedicated Chrome window stays behind your other windows while it generates. Set `front` to bring it forward before each Send, as older versions did. Verification and sign-in windows always come forward. |
 | `CHATGPT_HEADLESS` | `false` | Hide the browser. Works only in `playwright` or `webkit` mode. |
 | `CHATGPT_CHROME_EXECUTABLE` | auto-detected | Path to Chrome if it's installed somewhere unusual. |
 | `CHATGPT_DATA_DIR` | `~/.chatgpt-images-mcp/data` | Where sessions, jobs, and images are stored. |

@@ -75,6 +75,8 @@ export async function ensureChrome(config: Config): Promise<string> {
     // Restore session cookies without opening restored windows or an extra blank tab.
     '--restore-last-session',
     '--no-startup-window',
+    // Background mode: keep full speed while other windows cover Chrome, so Send never stalls.
+    ...(config.browserFocus === 'background' ? ['--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--disable-background-timer-throttling'] : []),
   ], { detached: true, stdio: 'ignore' });
   let failed = false;
   let exited = false;

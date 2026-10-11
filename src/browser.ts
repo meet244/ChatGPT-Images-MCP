@@ -43,6 +43,8 @@ export class ChatGPTBrowser {
   private page?: Page;
   private starting?: Promise<Page>;
   private manualHandoff = false;
+  /** The page reports itself focused without its window being activated (background mode). */
+  private focusEmulated = false;
   private readonly baseUrl: string;
   /** How long a verification page may take to clear by itself before ordinary Chrome is opened. */
   private readonly verificationWaitMs: number;
@@ -56,6 +58,18 @@ export class ChatGPTBrowser {
     if (this.starting) return this.starting;
     this.starting = this.launch();
     try { return await this.starting; } finally { this.starting = undefined; }
+  }
+
+  private get background(): boolean { return this.config.browserMode === 'cdp' && this.config.browserFocus === 'background'; }
+
+  /** A new window; in background mode Chrome creates it behind other windows instead of activating itself. */
+  private async createPage(): Promise<Page> {
+    if (!this.background || !this.connection) return this.context!.newPage();
+    const created = this.context!.waitForEvent('page', { timeout: 15_000 });
+    const session = await this.connection.newBrowserCDPSession();
+    try { await session.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true }); }
+    finally { await session.detach().catch(() => {}); }
+    return created;
   }
 
   private async launch(): Promise<Page> {
@@ -91,10 +105,18 @@ export class ChatGPTBrowser {
       if (missing.length) await this.context.addCookies(missing);
       const origin = new URL(this.baseUrl).origin;
       this.page = this.context.pages().find(page => { try { return new URL(page.url()).origin === origin; } catch { return false; } })
-        ?? this.context.pages().find(page => page.url() === 'about:blank') ?? this.context.pages()[0] ?? await this.context.newPage();
+        ?? this.context.pages().find(page => page.url() === 'about:blank') ?? this.context.pages()[0] ?? await this.createPage();
       if (this.config.browserMode === 'cdp') {
         // This is our dedicated profile: keep one tab even if Chrome restored old windows.
         for (const extra of this.context.pages()) if (extra !== this.page) await extra.close();
+      }
+      if (this.background) {
+        // The page behaves as focused, so Send works without bringing the window to the front.
+        try {
+          const session = await this.context.newCDPSession(this.page);
+          await session.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+          this.focusEmulated = true;
+        } catch { this.focusEmulated = false; }
       }
       return this.page;
     } catch (error) {
@@ -382,8 +404,11 @@ export class ChatGPTBrowser {
   private async submitPrompt(page: Page, composer: Locator, initialAssistantCount: number, initialGalleryCount: number, initialResultSources: ReadonlySet<string>, referenceNames: string[] = []): Promise<void> {
     const send = page.locator(this.config.selectors.send).filter({ visible: true }).first();
     // Activate before checking readiness: foregrounding can update upload UI state.
-    try { await page.bringToFront(); }
-    catch { throw new BrowserError('Could not activate the ChatGPT tab to send the prompt. No prompt was submitted. Keep the dedicated Chrome window open.'); }
+    // In background mode focus emulation already makes the page active, so the window stays behind.
+    if (!this.focusEmulated) {
+      try { await page.bringToFront(); }
+      catch { throw new BrowserError('Could not activate the ChatGPT tab to send the prompt. No prompt was submitted. Keep the dedicated Chrome window open.'); }
+    }
     const readyDeadline = Date.now() + (referenceNames.length ? this.config.timeoutMs : Math.min(60_000, this.config.timeoutMs));
     let readySince = 0;
     while (Date.now() < readyDeadline) {
@@ -661,5 +686,6 @@ export class ChatGPTBrowser {
     } else { await this.context?.close(); }
     this.context = undefined;
     this.page = undefined;
+    this.focusEmulated = false;
   }
 }
