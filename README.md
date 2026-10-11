@@ -84,6 +84,8 @@ Your agent handles this automatically. For reference, the tools work like this:
 
 An image can take a few minutes; the default timeout is 5 minutes. Keep the dedicated Chrome window open while it works. The server closes it once the queue is empty.
 
+**Verification checks.** If ChatGPT shows a "verify you are human" page before the prompt is sent, the server first waits up to 10 seconds for it to clear by itself. If it doesn't, the server opens the same account in normal Chrome for 10 seconds (`CHATGPT_MANUAL_CLOSE_MS`), which usually passes the check, then reconnects and tries once more. You may see a second Chrome window appear briefly. If the check appears after the prompt was sent, the job stops instead, so a prompt is never sent twice.
+
 ### Reference images
 
 Pass up to **4** PNG, JPEG, or WebP files as absolute paths. Each can be at most 20 MB and 40 megapixels.
@@ -179,7 +181,7 @@ You can also pass settings when you register the server, for example `claude mcp
 | --- | --- | --- |
 | `CHATGPT_AUTO_SWITCH_ACCOUNTS` | `true` | Move a job to another ready account when one hits its image limit. |
 | `CHATGPT_TIMEOUT_MS` | `300000` | Longest wait for one image, in milliseconds. |
-| `CHATGPT_MANUAL_CLOSE_MS` | `10000` | How long each setup Chrome window stays open for verification. `0` waits until you quit Chrome yourself. |
+| `CHATGPT_MANUAL_CLOSE_MS` | `10000` | How long normal Chrome stays open to pass a verification check, during setup and before a retried image. During setup, `0` waits until you quit Chrome yourself; before an image it means 10 seconds. |
 | `CHATGPT_BROWSER_MODE` | `cdp` | `cdp` uses your installed Chrome. Alternatives are `playwright` and `webkit` (see below). |
 | `CHATGPT_HEADLESS` | `false` | Hide the browser. Works only in `playwright` or `webkit` mode. |
 | `CHATGPT_CHROME_EXECUTABLE` | auto-detected | Path to Chrome if it's installed somewhere unusual. |
@@ -236,7 +238,7 @@ A running server, or another setup command, is using that account. `manage-accou
 The first launch after a new release downloads the package, which can be slower than your agent's startup timeout. Run `npx chatgpt-images-mcp@latest doctor` once in a terminal to finish the download, then restart your agent. `npx` checks npm for new releases when the server starts, so it needs internet access then.
 
 **Status is `challenge` (verification keeps appearing)**
-Run `npx chatgpt-images-mcp manage-accounts`, select the account, choose **Sign in again with Chrome**, and complete the check. If it keeps coming back, close your agent sessions and complete it in normal Chrome instead:
+The server already tries normal Chrome once by itself (see [Verification checks](#using-it)). If the job still fails, run `npx chatgpt-images-mcp manage-accounts`, select the account, choose **Sign in again with Chrome**, and complete the check. If it keeps coming back, close your agent sessions and complete it in normal Chrome instead:
 
 ```sh
 npx chatgpt-images-mcp browser-manual --account main

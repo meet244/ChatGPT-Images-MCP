@@ -9,7 +9,7 @@ import { readCookies, normalizeCookies, hasSessionCookies, type BrowserCookie } 
 import { readSavedCookies, saveCookies } from './session-store.js';
 import { inspectSavedSession } from './saved-session.js';
 import type { ImageArtifact } from './store.js';
-import { connectChrome, ChromeError, seedManualChromeCookies, openManualChrome, stopChrome } from './chrome.js';
+import { connectChrome, ChromeError, seedManualChromeCookies, openManualChrome, finishManualChrome, stopChrome } from './chrome.js';
 import { generationLimitNotice, type GenerationLimitNotice } from './limits.js';
 
 export type SessionStatus = { status: 'ready' | 'login_required' | 'challenge' | 'unavailable'; message: string };
@@ -30,6 +30,8 @@ export class BrowserError extends Error {
 export class TextOnlyResponseError extends BrowserError {
   constructor() { super('ChatGPT finished with a text response but no generated image. Check the conversation for a refusal, usage limit, or unavailable image tool.'); }
 }
+/** Verification shown before the prompt was sent, so trying again cannot submit it twice. */
+class VerificationBeforeSubmitError extends BrowserError {}
 class ConversationFullError extends BrowserError {
   constructor() { super('ChatGPT explicitly reported that this conversation is full.'); }
 }
@@ -41,8 +43,11 @@ export class ChatGPTBrowser {
   private starting?: Promise<Page>;
   private manualHandoff = false;
   private readonly baseUrl: string;
-  constructor(private config: Config, options: { baseUrl?: string } = {}) {
+  /** How long a verification page may take to clear by itself before ordinary Chrome is opened. */
+  private readonly verificationWaitMs: number;
+  constructor(private config: Config, options: { baseUrl?: string; verificationWaitMs?: number } = {}) {
     this.baseUrl = options.baseUrl ?? 'https://chatgpt.com/';
+    this.verificationWaitMs = options.verificationWaitMs ?? 10_000;
   }
 
   private async start(): Promise<Page> {
@@ -245,21 +250,46 @@ export class ChatGPTBrowser {
 
   async generate(jobId: string, prompt: string, onSubmitted: (url: string) => void, referenceImages: ImageArtifact[] = [], options: GenerationOptions = {}): Promise<GenerationResult> {
     try {
-      try { return await this.generateInBrowser(jobId, prompt, onSubmitted, referenceImages, options); }
+      try { return await this.generateWithRollover(jobId, prompt, onSubmitted, referenceImages, options); }
       catch (error) {
-        if (!(error instanceof ConversationFullError) || !options.allowConversationRollover) throw error;
-        // Only a definitive conversation-length rejection is safe to continue in a new chat.
-        // Re-upload original snapshots. Never retry account limits, timeouts, or unknown errors.
-        const page = await this.start();
-        await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-        return await this.generateInBrowser(jobId, prompt, onSubmitted, referenceImages,
-          options.aspectRatio !== undefined ? { aspectRatio: options.aspectRatio } : {});
+        if (!(error instanceof VerificationBeforeSubmitError) || this.config.browserMode !== 'cdp') throw error;
+        // Verification appeared before Send, so nothing was submitted. Ordinary Chrome, which has no
+        // automation endpoint, can usually pass it on the same profile; then try once more.
+        await this.verifyInOrdinaryChrome();
+        try { return await this.generateWithRollover(jobId, prompt, onSubmitted, referenceImages, options); }
+        catch (retry) {
+          if (!(retry instanceof VerificationBeforeSubmitError)) throw retry;
+          throw new BrowserError(`ChatGPT still asks for verification after this account was opened in normal Chrome. No prompt was submitted. Run ${cli('manage-accounts')}, select this account, choose "Sign in again with Chrome" and complete the check.`);
+        }
       }
     }
     catch (error) {
       if (error instanceof BrowserError) throw error;
       throw new BrowserError(`Browser interaction failed. Inspect the page with ${cli('login')} and check the selector overrides. Check the conversation before submitting again.`);
     }
+  }
+
+  private async generateWithRollover(jobId: string, prompt: string, onSubmitted: (url: string) => void, referenceImages: ImageArtifact[], options: GenerationOptions): Promise<GenerationResult> {
+    try { return await this.generateInBrowser(jobId, prompt, onSubmitted, referenceImages, options); }
+    catch (error) {
+      if (!(error instanceof ConversationFullError) || !options.allowConversationRollover) throw error;
+      // Only a definitive conversation-length rejection is safe to continue in a new chat.
+      // Re-upload original snapshots. Never retry account limits, timeouts, or unknown errors.
+      const page = await this.start();
+      await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      return await this.generateInBrowser(jobId, prompt, onSubmitted, referenceImages,
+        options.aspectRatio !== undefined ? { aspectRatio: options.aspectRatio } : {});
+    }
+  }
+
+  /** Open this profile in ordinary Chrome for a short time, as cookie setup does, then hand it back to controlled Chrome. */
+  async verifyInOrdinaryChrome(): Promise<void> {
+    await this.close();
+    const manual = await openManualChrome(this.config, { urls: [this.baseUrl] });
+    // A queued job must not wait for someone to quit Chrome, so 0 ("wait for manual exit") uses the default here.
+    await finishManualChrome(manual, this.config.manualCloseMs || 10_000);
+    // The ordinary browser's refreshed cookies become the source of truth on the next launch.
+    this.manualHandoff = true;
   }
 
   private async generateInBrowser(jobId: string, prompt: string, onSubmitted: (url: string) => void, referenceImages: ImageArtifact[], options: GenerationOptions): Promise<GenerationResult> {
@@ -273,8 +303,14 @@ export class ChatGPTBrowser {
     }
     // A full-chat notice can replace the composer entirely; check it before readiness.
     this.throwForLimit(await this.visibleLimit(page));
-    const status = await this.sessionStatus(false);
+    let status = await this.sessionStatus(false);
+    // Cloudflare's "Just a moment" page often clears by itself within a few seconds.
+    for (const deadline = Date.now() + this.verificationWaitMs; status.status === 'challenge' && Date.now() < deadline;) {
+      await delay(500);
+      status = await this.inspect(page);
+    }
     this.throwForLimit(await this.visibleLimit(page));
+    if (status.status === 'challenge') throw new VerificationBeforeSubmitError(status.message);
     if (status.status !== 'ready') throw new BrowserError(status.message);
     if (options.conversationUrl && page.url() !== options.conversationUrl) throw new BrowserError('The saved batch conversation could not be opened. No prompt was submitted.');
     if (await page.locator(stopButtons).filter({ visible: true }).count()) throw new BrowserError('ChatGPT is still responding to an earlier request. No new prompt was submitted. Check that conversation before continuing.');
@@ -448,7 +484,8 @@ export class ChatGPTBrowser {
       let readySince = 0;
       while (Date.now() < deadline) {
         const state = await this.inspect(page);
-        if (state.status === 'login_required' || state.status === 'challenge') throw new BrowserError(`${state.message} No prompt was submitted.`);
+        if (state.status === 'challenge') throw new VerificationBeforeSubmitError(`${state.message} No prompt was submitted.`);
+        if (state.status === 'login_required') throw new BrowserError(`${state.message} No prompt was submitted.`);
         const alerts = await page.locator('[role="alert"]').allTextContents();
         if (alerts.some(text => /(?:upload|file|image|attachment).*(?:failed|error|unable|unsupported|too large|limit)|(?:failed|unable).*(?:upload|attach)/i.test(text))) {
           throw new BrowserError('ChatGPT rejected a reference image upload. No prompt was submitted. Inspect the upload error in Chrome.');

@@ -439,7 +439,8 @@ for (const mode of ['playwright', 'cdp', 'webkit'] as const) test(`MCP → queue
       assert.equal(await (await uploadFailure.open()).evaluate(() => sessionStorage.getItem('unexpectedReferenceSubmission')), null);
     } finally { await uploadFailure.close(); }
     for (const [route, expected] of [['login', 'login_required'], ['challenge', 'challenge'], ['challenge-title', 'challenge']]) {
-      const alternate = new ChatGPTBrowser(config, { baseUrl: `${baseUrl}${route}` });
+      // Short waits: in CDP mode a verification page also goes through the ordinary-Chrome handoff once.
+      const alternate = new ChatGPTBrowser({ ...config, manualCloseMs: 500 }, { baseUrl: `${baseUrl}${route}`, verificationWaitMs: 500 });
       try {
         assert.equal((await alternate.sessionStatus()).status, expected);
         await assert.rejects(alternate.generate(randomUUID(), 'Do not submit', () => {}), /signed in|verification/);
