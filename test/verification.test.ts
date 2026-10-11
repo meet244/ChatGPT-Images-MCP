@@ -51,7 +51,7 @@ async function fixture(clears: 'ordinary' | 'self' | 'never' | 'after-send') {
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-verification-'));
-  config = loadConfig({ CHATGPT_DATA_DIR: dir, CHATGPT_POLL_MS: '100', CHATGPT_MANUAL_CLOSE_MS: '1500' });
+  config = loadConfig({ CHATGPT_DATA_DIR: dir, CHATGPT_POLL_MS: '100', CHATGPT_MANUAL_CLOSE_MS: '3000' });
   const browser = new ChatGPTBrowser(config, { baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/`, verificationWaitMs: 1500 });
   return { browser, counts, async close() {
     await browser.shutdown().catch(() => {});

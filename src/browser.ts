@@ -162,6 +162,8 @@ export class ChatGPTBrowser {
 
   async open(): Promise<Page> {
     const page = await this.start();
+    // Chrome can restore an old tab after launch; keep this dedicated profile at one tab.
+    if (this.config.browserMode === 'cdp') for (const extra of page.context().pages()) if (extra !== page) await extra.close().catch(() => {});
     if (page.url() === this.baseUrl || page.url() === this.baseUrl.replace(/\/$/, '')) return page;
     try { await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 }); }
     catch { throw new BrowserError('Cannot open ChatGPT. Check your network and browser session.'); }

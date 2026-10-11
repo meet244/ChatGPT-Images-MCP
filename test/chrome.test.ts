@@ -30,7 +30,7 @@ test('CDP endpoints accept only local ports and a browser ID', () => {
   assert.throws(() => loadConfig({ CHATGPT_HEADLESS: 'true' }), /visible Chrome/);
 });
 
-test('cookie setup closes manual Chrome after ten seconds and controlled Chrome after checking, retaining the verified profile', { timeout: 40_000 }, async () => {
+test('cookie setup closes manual Chrome after ten seconds and controlled Chrome after checking, retaining the verified profile', { timeout: 90_000 }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-setup-autoclose-'));
   const config = loadConfig({ CHATGPT_DATA_DIR: dir });
   const messages: string[] = [];
@@ -126,7 +126,7 @@ test('cookie import seeds a named profile, opens ordinary Chrome first, and pres
   }
 });
 
-test('cold generation launches Chrome once, reuses it, and preserves the signed-in profile', { timeout: 35_000 }, async t => {
+test('cold generation launches Chrome once, reuses it, and preserves the signed-in profile', { timeout: 90_000 }, async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-generation-single-open-'));
   const config = loadConfig({ CHATGPT_DATA_DIR: dir, CHATGPT_POLL_MS: '100' });
   const png = await sharp({ create: { width: 300, height: 300, channels: 3, background: '#26a269' } }).png().toBuffer();
@@ -276,7 +276,7 @@ test('CDP reconnect preserves live cookies and browser state, and explicit close
   }
 });
 
-test('account status checks close real dedicated Chrome and subsequent work reuses one ChatGPT tab', { timeout: 30_000 }, async () => {
+test('account status checks close real dedicated Chrome and subsequent work reuses one ChatGPT tab', { timeout: 90_000 }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'images-single-chrome-'));
   const fixture = createServer((_req, res) => {
     res.setHeader('content-type', 'text/html');

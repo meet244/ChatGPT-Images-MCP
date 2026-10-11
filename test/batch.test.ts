@@ -206,6 +206,6 @@ for (const scenario of ['same_chat', 'rollover', 'preflight_rollover', 'usage_li
     const stopped = queue.stop(); await browser.close(); await stopped;
     await client.close(); await server.close(); store.close(); await stopChrome(config);
     await new Promise<void>(resolve => fixture.close(() => resolve()));
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

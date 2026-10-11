@@ -1,6 +1,6 @@
 import path from 'node:path';
 import os from 'node:os';
-import { access, mkdir, readFile, rm } from 'node:fs/promises';
+import { access, lstat, mkdir, readFile, rm } from 'node:fs/promises';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -11,6 +11,17 @@ import { normalizeCookies, hasSessionCookies, type BrowserCookie } from './cooki
 export class ChromeError extends Error {}
 
 export const chromeProfile = (config: Config): string => path.join(config.dataDir, 'chrome-profile');
+
+/**
+ * Wait until the previous Chrome process has fully released this profile. On Linux the process can
+ * outlive its debugging port briefly; a Chrome started meanwhile hands its URL to the exiting process
+ * and quits, losing anything that visit sets. A crashed Chrome can leave a stale lock, so this gives up quietly.
+ */
+export async function waitForProfileRelease(config: Config, timeoutMs = 10_000): Promise<void> {
+  const lock = path.join(chromeProfile(config), 'SingletonLock');
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && await lstat(lock).then(() => true, () => false)) await delay(100);
+}
 
 export async function findChrome(config: Config): Promise<string> {
   const candidates = config.chromeExecutable ? [config.chromeExecutable] : process.platform === 'darwin'
@@ -53,6 +64,7 @@ export async function ensureChrome(config: Config): Promise<string> {
   const existing = await runningChrome(config);
   if (existing) return existing;
   const executable = await findChrome(config);
+  await waitForProfileRelease(config);
   await rm(path.join(profile, 'DevToolsActivePort'), { force: true });
   const child = spawn(executable, [
     `--user-data-dir=${profile}`,
@@ -118,6 +130,7 @@ export async function openManualChrome(config: Config, options: { urls?: string[
   const stopped = await stopChrome(config);
   // Allow Chrome to finish releasing its profile after its debugging server closes.
   if (stopped) await delay(500);
+  await waitForProfileRelease(config);
   await rm(path.join(profile, 'DevToolsActivePort'), { force: true });
   const child = spawn(executable, [
     `--user-data-dir=${profile}`,
@@ -193,7 +206,7 @@ export async function seedManualChromeCookies(config: Config, input: BrowserCook
 export async function stopChrome(config: Config, options: { saveCookies?: boolean } = {}): Promise<boolean> {
   const endpoint = await runningChrome(config);
   if (!endpoint) return false;
-  const browser = await chromium.connectOverCDP(endpoint, { noDefaults: true, timeout: 10_000 });
+  const browser = await chromium.connectOverCDP(endpoint, { noDefaults: true, timeout: 30_000 });
   try {
     if (options.saveCookies !== false) {
       const context = browser.contexts()[0];
@@ -207,5 +220,6 @@ export async function stopChrome(config: Config, options: { saveCookies?: boolea
     if (Date.now() > deadline) throw new Error('Dedicated Chrome is still shutting down. Close its window manually before restarting.');
     await delay(100);
   }
+  await waitForProfileRelease(config);
   return true;
 }
