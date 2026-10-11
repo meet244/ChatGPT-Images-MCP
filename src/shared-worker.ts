@@ -8,6 +8,7 @@ import lockfile from 'proper-lockfile';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { type Config, projectRoot, cli } from './config.js';
 import { acquireRuntime } from './runtime.js';
+import { logEvent, rotateLog } from './events.js';
 import { ChatGPTBrowser } from './browser.js';
 import { JobStore } from './store.js';
 import { JobQueue } from './queue.js';
@@ -73,6 +74,7 @@ async function connectWorker(config: Config): Promise<Socket> {
     // converge on it rather than starting independent browser/queue workers.
     if (!launched && !await lockfile.check(config.dataDir, { stale: 30_000 })) {
       launched = true;
+      await rotateLog(path.join(config.dataDir, 'worker.log'));
       const log = await open(path.join(config.dataDir, 'worker.log'), 'a', 0o600);
       try {
         const child = spawn(process.execPath, [path.join(projectRoot, 'dist/index.js'), 'worker'], {
@@ -196,6 +198,7 @@ export async function startSharedWorker(config: Config, options: { browser?: Cha
       await rename(temporary, endpointFile(config));
     } finally { await rm(temporary, { force: true }); }
     listener.on('error', () => { void close(); });
+    logEvent(`worker started (pid ${process.pid})`);
     if ((await accounts.registry.names()).includes('default')) queue.kick();
     // Give the launching client time to attach; afterwards idle workers exit promptly.
     scheduleIdle(5000);

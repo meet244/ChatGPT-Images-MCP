@@ -2,18 +2,14 @@ import path from 'node:path';
 import { access, readFile, stat } from 'node:fs/promises';
 import { styleText } from 'node:util';
 import { chromium, webkit } from 'playwright';
-import { cli, installKind, projectRoot, type Config } from './config.js';
+import { cli, installKind, packageVersion, projectRoot, type Config } from './config.js';
 import { findChrome } from './chrome.js';
 import type { AccountRegistry } from './accounts.js';
 import { accountOverview, describeStatus } from './account-overview.js';
+import { diskUsage, formatBytes, type AccountDisk } from './cleanup.js';
 import { clientLabels, describeRegistration, inspectClient, systemEnvironment, type ClientEnvironment, type ClientName } from './clients.js';
 
 export interface Check { section: string; status: 'ok' | 'warn' | 'fail' | 'info'; text: string; fix?: string }
-
-export async function packageVersion(): Promise<string> {
-  try { return (JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8')) as { version?: string }).version ?? 'unknown'; }
-  catch { return 'unknown'; }
-}
 
 /** Whether a background server is running for this data folder, by its endpoint file and process. */
 export async function runningServer(config: Config): Promise<number | undefined> {
@@ -52,7 +48,7 @@ export function nodeCheck(version = process.versions.node): Check {
 export async function runDoctor(config: Config, registry: AccountRegistry, environment: ClientEnvironment = systemEnvironment): Promise<Check[]> {
   const checks: Check[] = [];
   const installed = { npx: 'run through npx', global: 'installed globally with npm', source: `source checkout at ${path.resolve(projectRoot)}` }[installKind];
-  checks.push({ section: 'Setup', status: 'info', text: `chatgpt-images-mcp ${await packageVersion()}, ${installed}` });
+  checks.push({ section: 'Setup', status: 'info', text: `chatgpt-images-mcp ${packageVersion}, ${installed}` });
   checks.push(nodeCheck());
   checks.push(await browserCheck(config));
   try {
@@ -84,6 +80,15 @@ export async function runDoctor(config: Config, registry: AccountRegistry, envir
   } catch (error) {
     checks.push({ section: 'Accounts', status: 'fail', text: error instanceof Error ? error.message : 'Accounts could not be read.' });
   }
+
+  try {
+    const disk = await diskUsage(registry);
+    const sum = (pick: (item: AccountDisk) => number) => disk.reduce((total, item) => total + pick(item), 0);
+    const total = sum(item => item.profile + item.images + item.references);
+    checks.push({ section: 'Disk', status: 'info', text: `${formatBytes(total)} used: Chrome profiles ${formatBytes(sum(item => item.profile))}, images ${formatBytes(sum(item => item.images))}, reference copies ${formatBytes(sum(item => item.references))}` });
+    const reclaimable = sum(item => item.cache);
+    if (reclaimable > 200 * 1024 * 1024) checks.push({ section: 'Disk', status: 'warn', text: `${formatBytes(reclaimable)} of that is Chrome cache, which is safe to remove.`, fix: cli('cleanup') });
+  } catch { /* Disk use is informational only. */ }
 
   for (const client of ['claude', 'codex'] as ClientName[]) {
     const state = await inspectClient(client, environment);

@@ -106,7 +106,7 @@ test('real stdio client initializes, lists tools, validates input, and shuts dow
   try {
     await client.connect(transport);
     const tools = await client.listTools();
-    assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['add_account', 'cancel_job', 'generate_image', 'generate_images', 'get_batch_status', 'get_image', 'get_job_status', 'list_accounts', 'list_jobs', 'session_status', 'wait_for_job']);
+    assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['add_account', 'cancel_job', 'generate_image', 'generate_images', 'get_batch_status', 'get_image', 'get_job_status', 'list_accounts', 'list_jobs', 'save_image', 'session_status', 'wait_for_job']);
     const batchSchema = tools.tools.find(tool => tool.name === 'generate_images')!.inputSchema;
     assert.equal(batchSchema.properties!.different_chat, undefined);
     assert.equal((batchSchema.properties!.same_chat_mandatory as any).type, 'boolean');

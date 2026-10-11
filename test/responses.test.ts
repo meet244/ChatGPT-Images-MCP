@@ -97,7 +97,7 @@ test('all eleven tools return only useful public fields, keeping routing and ful
     for (const job of history.jobs) keys(job, job.status === 'failed'
       ? ['id', 'status', 'updatedAt', 'error', 'retryAfter'] : ['id', 'status', 'updatedAt']);
     const created = (await call('add_account', { account: 'work' })).value;
-    assert.deepEqual(created, { account: 'work', status: 'login_required', message: `Run ${cli('setup --account work')} in a terminal to sign in.` });
+    assert.deepEqual(created, { account: 'work', status: 'login_required', message: `Run ${cli('manage-accounts')} in a terminal, select work and sign in.` });
     const profiles = (await call('list_accounts')).value;
     keys(profiles, ['active_account', 'accounts']);
     profiles.accounts.forEach((account: object) => keys(account, ['account', 'has_saved_session']));

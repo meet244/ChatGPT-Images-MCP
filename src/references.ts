@@ -1,8 +1,8 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { open, mkdir, writeFile, chmod, rm } from 'node:fs/promises';
+import { open, mkdir, writeFile, chmod, rm, readdir, stat } from 'node:fs/promises';
 import sharp from 'sharp';
-import type { ImageArtifact } from './store.js';
+import type { ImageArtifact, JobStore } from './store.js';
 
 export const maxReferenceImages = 4;
 const maxBytes = 20 * 1024 * 1024;
@@ -61,4 +61,33 @@ export async function stageReferences(dataDir: string, paths: string[]): Promise
 
 export async function discardReferences(images: ImageArtifact[]): Promise<void> {
   if (images[0]) await rm(path.dirname(images[0].path), { recursive: true, force: true });
+}
+
+/** Reference copies are kept while a queued or running job may still upload them (retries, failover, batch restarts). */
+export const referenceGraceMs = 10 * 60 * 1000;
+
+/**
+ * Delete reference copies that no queued or running job uses. Copies younger than the grace period
+ * are kept, so a request that is still being admitted can never lose its files.
+ */
+export async function pruneReferences(store: Pick<JobStore, 'dataDir' | 'byStatus'>, graceMs = referenceGraceMs, now = Date.now(), dryRun = false): Promise<{ removed: number; bytes: number }> {
+  const root = path.join(store.dataDir, 'references');
+  let entries: string[];
+  try { entries = await readdir(root); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { removed: 0, bytes: 0 }; throw error; }
+  const inUse = new Set([...store.byStatus('queued'), ...store.byStatus('running')]
+    .flatMap(job => (job.referenceImages ?? []).map(image => path.resolve(path.dirname(image.path)))));
+  let removed = 0, bytes = 0;
+  for (const name of entries) {
+    const directory = path.resolve(root, name);
+    if (inUse.has(directory)) continue;
+    try {
+      const info = await stat(directory);
+      if (!info.isDirectory() || now - info.mtimeMs < graceMs) continue;
+      for (const file of await readdir(directory)) bytes += (await stat(path.join(directory, file))).size;
+      if (!dryRun) await rm(directory, { recursive: true, force: true });
+      removed++;
+    } catch { /* Skip entries that disappear or cannot be read. */ }
+  }
+  return { removed, bytes };
 }

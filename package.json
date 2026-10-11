@@ -26,7 +26,8 @@
   },
   "files": [
     "dist/**/*.js",
-    "npm-shrinkwrap.json"
+    "npm-shrinkwrap.json",
+    "CHANGELOG.md"
   ],
   "bin": {
     "chatgpt-images-mcp": "dist/index.js"

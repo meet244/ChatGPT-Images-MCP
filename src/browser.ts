@@ -11,6 +11,7 @@ import { inspectSavedSession } from './saved-session.js';
 import type { ImageArtifact } from './store.js';
 import { connectChrome, ChromeError, seedManualChromeCookies, openManualChrome, finishManualChrome, stopChrome } from './chrome.js';
 import { generationLimitNotice, type GenerationLimitNotice } from './limits.js';
+import { logEvent } from './events.js';
 
 export type SessionStatus = { status: 'ready' | 'login_required' | 'challenge' | 'unavailable'; message: string };
 type Candidate = { src: string; width: number; height: number };
@@ -255,10 +256,12 @@ export class ChatGPTBrowser {
         if (!(error instanceof VerificationBeforeSubmitError) || this.config.browserMode !== 'cdp') throw error;
         // Verification appeared before Send, so nothing was submitted. Ordinary Chrome, which has no
         // automation endpoint, can usually pass it on the same profile; then try once more.
+        logEvent(`verification page before Send on '${path.basename(this.config.dataDir)}'; opening normal Chrome, then retrying once`);
         await this.verifyInOrdinaryChrome();
         try { return await this.generateWithRollover(jobId, prompt, onSubmitted, referenceImages, options); }
         catch (retry) {
           if (!(retry instanceof VerificationBeforeSubmitError)) throw retry;
+          logEvent(`verification still shown on '${path.basename(this.config.dataDir)}' after normal Chrome; stopped without sending`);
           throw new BrowserError(`ChatGPT still asks for verification after this account was opened in normal Chrome. No prompt was submitted. Run ${cli('manage-accounts')}, select this account, choose "Sign in again with Chrome" and complete the check.`);
         }
       }

@@ -1,11 +1,16 @@
 import os from 'node:os';
 import path from 'node:path';
-import { accessSync, constants, realpathSync } from 'node:fs';
+import { accessSync, constants, readFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 
 export const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 export const packageName = 'chatgpt-images-mcp';
+/** The package version, from package.json, so releases need only one version bump. */
+export const packageVersion: string = (() => {
+  try { return (JSON.parse(readFileSync(path.join(projectRoot, 'package.json'), 'utf8')) as { version?: string }).version ?? '0.0.0'; }
+  catch { return '0.0.0'; }
+})();
 // npm replaces packages under node_modules on update, so package installs keep
 // .env and private data in the home directory. Source checkouts keep them here.
 const packaged = projectRoot.split(path.sep).includes('node_modules');

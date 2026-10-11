@@ -18,7 +18,7 @@ import { defaultActions } from '../src/account-menu.js';
 import { acquireRuntime } from '../src/runtime.js';
 import { AccountRegistry } from '../src/accounts.js';
 
-const names = ['add_account', 'cancel_job', 'generate_image', 'generate_images', 'get_batch_status', 'get_image', 'get_job_status', 'list_accounts', 'list_jobs', 'session_status', 'wait_for_job'];
+const names = ['add_account', 'cancel_job', 'generate_image', 'generate_images', 'get_batch_status', 'get_image', 'get_job_status', 'list_accounts', 'list_jobs', 'save_image', 'session_status', 'wait_for_job'];
 function clientFor(dir: string) {
   const client = new Client({ name: 'shared-worker-test', version: '1' });
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(projectRoot, 'dist/index.js'), 'serve'],

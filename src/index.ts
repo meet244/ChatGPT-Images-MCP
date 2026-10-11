@@ -21,6 +21,9 @@ const help = `ChatGPT Images MCP (local browser, no OpenAI API)
 Commands:
   init                      Guided setup: check requirements, add an account, connect Claude Code and Codex
   doctor                    Check Chrome, accounts, the background server and client connections
+  cleanup                   Free disk space: Chrome caches and unused reference copies
+      --images-older-than DAYS  Also delete generated images older than DAYS days
+      --yes                 Skip the confirmation question
   serve                     Connect stdio to the shared local MCP worker (default)
   browser                   Open/reuse dedicated Chrome in CDP mode, then disconnect
   browser-manual            Open ordinary Chrome for manual challenge diagnostics
@@ -51,11 +54,11 @@ serve always connects to the shared worker; account selection and failover are h
 
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({ options: {
-    account: { type: 'string' }, file: { type: 'string' }, prompt: { type: 'string' }, job: { type: 'string' }, reference: { type: 'string', multiple: true }, headed: { type: 'boolean' }, help: { type: 'boolean' },
+    account: { type: 'string' }, file: { type: 'string' }, prompt: { type: 'string' }, job: { type: 'string' }, reference: { type: 'string', multiple: true }, headed: { type: 'boolean' }, help: { type: 'boolean' }, yes: { type: 'boolean' }, 'images-older-than': { type: 'string' },
   }, allowPositionals: true });
   if (values.help) { console.log(help); return; }
   const command = positionals[0] ?? 'serve';
-  if (positionals.length > 1 || !['init', 'doctor', 'serve', 'worker', 'browser', 'browser-manual', 'browser-close', 'setup', 'paste-cookies', 'login', 'import-cookies', 'status', 'generate', 'recover', 'config', 'accounts', 'manage-accounts', 'account-add', 'account-use'].includes(command)) throw new Error(help);
+  if (positionals.length > 1 || !['init', 'doctor', 'cleanup', 'serve', 'worker', 'browser', 'browser-manual', 'browser-close', 'setup', 'paste-cookies', 'login', 'import-cookies', 'status', 'generate', 'recover', 'config', 'accounts', 'manage-accounts', 'account-add', 'account-use'].includes(command)) throw new Error(help);
   const baseConfig = loadConfig();
   const registry = new AccountRegistry(baseConfig);
   if (['account-add', 'account-use'].includes(command)) {
@@ -64,6 +67,30 @@ async function main(): Promise<void> {
       await registry.add(values.account);
       console.log(JSON.stringify({ account: values.account, status: 'login_required', message: `Run ${cli(`setup --account ${values.account}`)} to sign in or paste cookies in the terminal. The server can then select it automatically.` }, null, 2));
     } else { await registry.select(values.account); console.log(JSON.stringify({ account: values.account, selection_mode: 'manual' }, null, 2)); }
+    return;
+  }
+  if (command === 'cleanup') {
+    if (values.account) throw new Error('cleanup covers every account; it does not take --account.');
+    const days = values['images-older-than'];
+    if (days !== undefined && !/^\d+$/.test(days)) throw new Error('--images-older-than takes a whole number of days, such as 30.');
+    const { planCleanup, runCleanup, formatBytes } = await import('./cleanup.js');
+    const options = days !== undefined ? { imagesOlderThanDays: Number(days) } : {};
+    const plan = await planCleanup(registry, options);
+    const total = (items: typeof plan) => items.reduce((sum, item) => sum + item.cache + item.references + item.images.reduce((bytes, image) => bytes + image.bytes, 0), 0);
+    const images = plan.reduce((count, item) => count + item.images.length, 0);
+    console.log(`Chrome caches: ${formatBytes(plan.reduce((sum, item) => sum + item.cache, 0))} (rebuilt automatically; logins are kept)`);
+    console.log(`Unused reference copies: ${formatBytes(plan.reduce((sum, item) => sum + item.references, 0))}`);
+    if (days !== undefined) console.log(`Images older than ${days} days: ${images} (${formatBytes(plan.reduce((sum, item) => sum + item.images.reduce((bytes, image) => bytes + image.bytes, 0), 0))}). They can no longer be retrieved with get_image.`);
+    if (!total(plan)) { console.log('Nothing to clean up.'); return; }
+    if (!values.yes) {
+      if (!process.stdin.isTTY) throw new Error('Run cleanup in an interactive terminal, or add --yes.');
+      const reader = createInterface({ input: process.stdin, output: process.stderr });
+      const answer = await reader.question(`Free up to ${formatBytes(total(plan))}? [y/N] `).finally(() => reader.close());
+      if (!/^y(es)?$/i.test(answer.trim())) { console.log('Nothing was deleted.'); return; }
+    }
+    const done = await runCleanup(registry, options);
+    for (const item of done.filter(entry => entry.skipped)) console.log(`Skipped ${item.account}: ${item.skipped}.`);
+    console.log(`Freed ${formatBytes(total(done.filter(entry => !entry.skipped)))}.`);
     return;
   }
   if (command === 'doctor') {

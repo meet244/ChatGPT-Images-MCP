@@ -1,6 +1,7 @@
 import { JobStore, type Job, type ImageArtifact, type ChatMode, type Batch, type ImageCooldown } from './store.js';
 import { BrowserError, TextOnlyResponseError, type ChatGPTBrowser, type GenerationResult, type SessionStatus, type GenerationOptions } from './browser.js';
-import { stageReferences, discardReferences } from './references.js';
+import { stageReferences, discardReferences, pruneReferences } from './references.js';
+import { logEvent, seconds } from './events.js';
 
 export interface ImageGenerator {
   generate(jobId: string, prompt: string, onSubmitted: (url: string) => void, referenceImages?: ImageArtifact[], options?: GenerationOptions): Promise<GenerationResult>;
@@ -110,9 +111,18 @@ export class JobQueue {
     });
   }
   private async drain(): Promise<void> {
+    let processed = 0;
     while (!this.stopped) {
       const job = this.store.byStatus('queued')[0];
-      if (!job) return;
+      if (!job) {
+        // Only after real work: an idle check never spends time here. Unused reference copies can go.
+        if (processed) {
+          const pruned = await pruneReferences(this.store).catch(() => undefined);
+          if (pruned?.removed) logEvent(`removed ${pruned.removed} unused reference cop${pruned.removed === 1 ? 'y' : 'ies'}`);
+        }
+        return;
+      }
+      processed++;
       this.cleanupNeeded = true;
       const cooldown = this.store.imageCooldown();
       if (cooldown && !(job.autoSwitchAccount && this.executor)) {
@@ -123,6 +133,8 @@ export class JobQueue {
         continue;
       }
       this.store.update(job.id, { status: 'running' });
+      const started = Date.now();
+      logEvent(`job ${job.id} started${job.batchId ? ` (batch ${job.batchId}, prompt ${job.batchIndex! + 1})` : ''}`);
       try {
         const previous = job.batchId && job.chatMode === 'same_chat'
           ? this.store.getBatch(job.batchId).jobs.filter(item => item.batchIndex! < job.batchIndex! && item.status === 'completed').at(-1)
@@ -135,9 +147,11 @@ export class JobQueue {
           : await this.browser.generate(job.id, job.prompt, onSubmitted, job.referenceImages ?? [], options);
         if (!this.executor) this.store.resetTextOnlyFailures();
         this.store.update(job.id, { status: 'completed', ...result });
+        logEvent(`job ${job.id} completed in ${seconds(started)} with ${result.images.length} image${result.images.length === 1 ? '' : 's'}`);
       } catch (error) {
         // The account manager atomically requeued the whole mandatory batch after a definitive rejection.
-        if (error instanceof BatchRestartError) continue;
+        if (error instanceof BatchRestartError) { logEvent(`job ${job.id}: mandatory batch restarted on another account`); continue; }
+        logEvent(`job ${job.id} failed after ${seconds(started)}: ${error instanceof Error ? error.message : 'unknown error'}`);
         // Managed execution already records the outcome on the executing profile, not the owner.
         const textOnlyCooldown = !this.executor && error instanceof TextOnlyResponseError
           ? this.store.recordTextOnlyFailure() : undefined;

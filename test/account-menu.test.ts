@@ -225,7 +225,8 @@ test('the account list shows email, plan, session expiry, cooldowns, images per 
     assert.equal(byName.empty!.session, 'missing');
     assert.equal(byName.empty!.inUse, true);
     assert.equal(byName.work!.inUse, false);
-    assert.equal(describeStatus(byName.work!, now).text, 'ready · expires in 30 days · 3 images · used just now');
+    assert.equal(describeStatus(byName.work!, now).text, 'ready · expires in 30 days · 3 images (3 in last 24h) · used just now');
+    assert.equal(byName.work!.imagesLast24h, 3);
     assert.equal(describeStatus(byName.work!, now).tone, 'good');
     assert.match(describeStatus(byName.spare!, now).text, /^image limit · available /);
     assert.equal(describeStatus(byName.empty!, now).text, 'needs sign-in');

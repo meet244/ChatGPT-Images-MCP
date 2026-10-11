@@ -13,6 +13,8 @@ export interface AccountOverview {
   expiresAt?: number;
   cooldownUntil?: string;
   images: number;
+  /** Images generated in the last 24 hours, the window ChatGPT's image limits are usually counted over. */
+  imagesLast24h: number;
   lastUsed?: string;
   /** Another process (usually the MCP server) holds this profile. */
   inUse: boolean;
@@ -22,15 +24,16 @@ export interface AccountOverview {
 export async function accountOverview(registry: AccountRegistry, now = Date.now()): Promise<{ mode: 'priority' | 'manual'; manual?: string; accounts: AccountOverview[] }> {
   const listing = await registry.list();
   // Failover saves images under the profile that generated them, which can differ from the job's owner.
-  const usage = new Map<string, { images: number; lastUsed?: string }>();
+  const usage = new Map<string, { images: number; recent: number; lastUsed?: string }>();
   for (const { account: owner } of listing.accounts) {
     const rows = await registry.inspectDatabase(owner, db => db.prepare(`SELECT status, json_extract(body, '$.executionAccount') AS executed,
       json_extract(body, '$.updatedAt') AS updated, COALESCE(json_array_length(body, '$.images'), 0) AS images
       FROM jobs WHERE status IN ('completed', 'failed')`).all() as { status: string; executed: string | null; updated: string | null; images: number }[]).catch(() => undefined);
     for (const row of rows ?? []) {
       const account = row.executed ?? owner;
-      const entry = usage.get(account) ?? { images: 0 };
+      const entry = usage.get(account) ?? { images: 0, recent: 0 };
       if (row.status === 'completed') entry.images += row.images;
+      if (row.status === 'completed' && row.updated && now - Date.parse(row.updated) < 86_400_000) entry.recent += row.images;
       if (row.updated && (!entry.lastUsed || row.updated > entry.lastUsed)) entry.lastUsed = row.updated;
       usage.set(account, entry);
     }
@@ -59,6 +62,7 @@ export async function accountOverview(registry: AccountRegistry, now = Date.now(
       ...(expiresAt !== undefined ? { expiresAt } : {}),
       ...(cooldown ? { cooldownUntil: cooldown } : {}),
       images: usage.get(item.account)?.images ?? 0,
+      imagesLast24h: usage.get(item.account)?.recent ?? 0,
       ...(usage.get(item.account)?.lastUsed ? { lastUsed: usage.get(item.account)!.lastUsed } : {}),
       inUse,
     } satisfies AccountOverview;
@@ -76,7 +80,7 @@ export function relativeTime(target: number, now = Date.now()): string {
 
 /** One-line status, e.g. "ready · expires in 12 days · 42 images · used 2h ago". */
 export function describeStatus(account: AccountOverview, now = Date.now()): { text: string; tone: 'good' | 'warn' | 'bad' } {
-  const usage = [account.images ? `${account.images} image${account.images === 1 ? '' : 's'}` : '',
+  const usage = [account.images ? `${account.images} image${account.images === 1 ? '' : 's'}${account.imagesLast24h ? ` (${account.imagesLast24h} in last 24h)` : ''}` : '',
     account.lastUsed ? `used ${relativeTime(Math.min(Date.parse(account.lastUsed), now), now)}` : ''].filter(Boolean);
   if (account.session === 'missing') return { text: 'needs sign-in', tone: 'bad' };
   if (account.session === 'expired') return { text: 'session expired · sign in again', tone: 'bad' };

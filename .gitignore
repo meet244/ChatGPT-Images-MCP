@@ -10,3 +10,5 @@ cookies*.json
 *.sqlite*
 *.log
 test-results/
+.chatgpt-images*.lock/
+worker.log*

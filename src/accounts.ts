@@ -10,6 +10,7 @@ import { JobStore, imageCooldownMs, type ImageCooldown, type Job } from './store
 import { JobQueue, CooldownError, BatchRestartError } from './queue.js';
 import { acquireRuntime } from './runtime.js';
 import { stopChrome } from './chrome.js';
+import { logEvent } from './events.js';
 import { inspectSavedSession, type SavedSessionStatus } from './saved-session.js';
 
 export const accountNamePattern = /^[a-z][a-z0-9_-]{0,47}$/;
@@ -548,6 +549,7 @@ export class AccountManager {
           if (cooldown) throw new CooldownError(cooldown, runtime.account);
           await this.activateBrowser(runtime);
           attemptedAccounts.push(runtime.account);
+          logEvent(`job ${job.id} running on account '${runtime.account}'`);
           owner.store.update(job.id, { executionAccount: runtime.account, attemptedAccounts: [...attemptedAccounts], conversationUrl: undefined });
           // Conversations are private to a profile. Switching starts a fresh chat with the original snapshots.
           const sameAccount = runtime.account === (previous?.executionAccount ?? owner.account);
@@ -577,7 +579,8 @@ export class AccountManager {
       } catch (error) {
         if (!(error instanceof CooldownError) || !automatic || this.closing) throw error;
         const replacement = await this.fallback(excluded, owner);
-        if (!replacement) throw new CooldownError(error.cooldown, error.account, true);
+        if (!replacement) { logEvent(`job ${job.id}: account '${error.account ?? runtime.account}' hit its image limit; no other account is ready`); throw new CooldownError(error.cooldown, error.account, true); }
+        logEvent(`job ${job.id}: account '${error.account ?? runtime.account}' hit its image limit; switching to '${replacement.account}'`);
         await this.selectAfterLimit(runtime.account, replacement.account);
         if (job.sameChatMandatory && job.batchId) {
           owner.store.restartBatch(job.batchId, replacement.account, job.id, error.message);

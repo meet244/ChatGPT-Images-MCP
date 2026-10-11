@@ -81,6 +81,9 @@ Your agent handles this automatically. For reference, the tools work like this:
 2. The server uploads any references, sends the prompt to ChatGPT, and clicks **Send exactly once**.
 3. `wait_for_job` waits up to 25 seconds per call. While the job is `queued` or `running`, the agent calls it again with the same ID.
 4. `get_image` returns the saved file path and a preview.
+5. To put the image in your project, the agent calls `save_image` with an absolute path, such as `/path/to/project/public/hero.png`. It creates missing folders, converts to the format the file name asks for (`.png`, `.jpg` or `.webp`), and never replaces an existing file unless told to.
+
+You can simply ask, for example: *"Generate a hero image for the landing page and save it to public/hero.webp."*
 
 An image can take a few minutes; the default timeout is 5 minutes. Keep the dedicated Chrome window open while it works. The server closes it once the queue is empty.
 
@@ -126,9 +129,9 @@ The menu lists every account with its email, plan, and current state:
 ```text
 ◆  ChatGPT accounts · the top one is used first; the next takes over at an image limit
 │  ● you@example.com  Plus · --account main
-│      ready · expires in 12 days · 42 images · used 2h ago
+│      ready · expires in 12 days · 42 images (6 in last 24h) · used 2h ago
 │  ○ work@example.com  Free · --account work
-│      image limit · available Sat 14:30 · 9 images · used 5h ago
+│      image limit · available Sat 14:30 · 9 images (9 in last 24h) · used 5h ago
 │  ○ spare
 │      session expired · sign in again
 │  ○ + Add an account
@@ -208,7 +211,7 @@ Everything stays on your computer in `~/.chatgpt-images-mcp/`:
       jobs.sqlite             Prompts, job status, cooldowns
       images/<job-id>/        Generated images
       references/             Private copies of your reference images
-    worker.log                Server diagnostics
+    worker.log                Server event log (rotated at 5 MB)
 ```
 
 The folder is private (`700`) and holds your session secrets, so don't share it or commit it.
@@ -229,7 +232,9 @@ Start with:
 npx chatgpt-images-mcp doctor
 ```
 
-It checks Node.js, Chrome, the data folder, the background server, every account's sign-in state and image limit, and whether Claude Code and Codex use this copy. It prints a fix for each problem. The cases below cover what it can't fix by itself.
+It checks Node.js, Chrome, the data folder, the background server, every account's sign-in state, image limit and recent usage, disk use, and whether Claude Code and Codex use this copy. It prints a fix for each problem. The cases below cover what it can't fix by itself.
+
+To see what happened to a request, check the event log at `~/.chatgpt-images-mcp/data/worker.log` (or `.chatgpt-images/worker.log` in a source checkout). It records each job's start, account, verification handoffs, account switches, completion time and errors, but never prompts or cookies.
 
 **"This data directory is in use by another server or login command"**
 A running server, or another setup command, is using that account. `manage-accounts` frees idle accounts from a running server by itself, so try it there first. Otherwise, close every Claude Code and Codex session, including IDE extensions, and wait a few seconds for the background server to exit. A server with queued images exits once they finish. Then run your command again. Don't delete lock files or change `CHATGPT_DATA_DIR` to work around this.
@@ -268,6 +273,7 @@ Codex blocked the tool call. To let this server's tools run without prompting, a
 | --- | --- |
 | `npx chatgpt-images-mcp init` | Guided setup: requirements, first account, and Claude Code and Codex connections. |
 | `npx chatgpt-images-mcp doctor` | Check the whole setup and print a fix for each problem. |
+| `npx chatgpt-images-mcp cleanup [--images-older-than DAYS]` | Free disk space: Chrome caches, unused reference copies and, if asked, old images. |
 | `npx chatgpt-images-mcp manage-accounts` | Interactive menu: add and sign in to accounts, see their status, rename, reorder, delete. |
 | `npx chatgpt-images-mcp accounts` | List accounts as JSON, without opening a browser. |
 | `npx chatgpt-images-mcp setup --account NAME` | Check the session, then sign in through the browser or paste cookies. |
@@ -296,6 +302,7 @@ Commands that use a browser need the account to be free, so close your agent ses
 | `get_job_status` | Read a job's current status. |
 | `get_batch_status` | Read a batch's status and each of its jobs. |
 | `get_image` | Get a finished image's file path and a preview of up to 1024 px. |
+| `save_image` | Copy a finished image to a path you choose, such as a file in your project. |
 | `list_jobs` | List recent jobs across all accounts. |
 | `cancel_job` | Cancel a job that hasn't started yet. |
 | `list_accounts` | List account profiles and which one is selected. |
@@ -327,6 +334,12 @@ npm run test:live   # one real image request through ChatGPT (uses your quota)
 ```
 
 Tests use local fixture pages and fake sessions, so they don't use any ChatGPT image quota.
+
+### Releasing
+
+1. Update `version` in `package.json` and add a section to [CHANGELOG.md](CHANGELOG.md).
+2. Commit, then tag and push: `git tag v0.2.0 && git push --follow-tags`.
+3. The Release workflow runs the tests on macOS and publishes to npm. It needs an npm access token saved as the repository secret `NPM_TOKEN` (Settings → Secrets and variables → Actions).
 
 ## Notes
 
